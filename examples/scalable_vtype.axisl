@@ -1,0 +1,210 @@
+; RVV-shaped scalable vectors, stage S3: shapes that come from `vtype`
+; (docs/scalable_vectors_design.md, mechanisms M2 and M3).
+;
+; RVV puts type information in a dynamic CSR. `SEW` is the element width and
+; `LMUL` the rational register footprint, and between two `vsetvli`s both are
+; constant -- so AXIS elaborates one `(SEW, LMUL)` point at a time and the
+; ladder sweeps the points, exactly as it sweeps vector length and scalar width.
+;
+; `vti` is "the integer shape vtype describes" and `vtiw` its widened form: twice
+; the element at twice the register footprint. The two cancel, which is why a
+; widening operation has the same lane count as its operands -- and why lane-count
+; agreement, not shape equality, is the rule an instruction must satisfy.
+;
+; Not here, and deliberately: floating-point elements, because `vtf` is undefined
+; at SEW=8 and 16, so an FP instruction is *illegal at some mode points* rather
+; than wrong. Per-instruction mode legality is the decode half of M2 and waits
+; for a stage where decode means something -- see the note in scalable_basic.axisl
+; about lane instructions sharing an encoding.
+(axis-module scalable_vtype
+  (version "0.1.0")
+  (target rvmt)
+  (description "Element-wise and mixed-width arithmetic over a vtype-derived shape")
+
+  (defisa rvv_like
+    (base rv64im)
+    (word-bits 64)
+    (vector-bits 128)
+    (vector-sew 32)
+    (vector-lmul 1)
+    (vector-elen 64)
+    (registers "v[32]:i64" "pc:i64")
+    (features simd scalable custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat RVV_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (vs1 19 15)
+      (vs2 24 20)
+      (func7 31 25)))
+
+  (definstruction vadd_vv
+    (mnemonic VADD_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 0) (func7 0)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vadd.vv $vd, $vs1, $vs2")
+    (semantics "Add elements; element width and lane count both come from vtype")
+    (formal (add vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Add elements"))
+
+  (definstruction vsub_vv
+    (mnemonic VSUB_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 1) (func7 1)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vsub.vv $vd, $vs1, $vs2")
+    (semantics "Subtract elements; element width and lane count both come from vtype")
+    (formal (sub vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Subtract elements"))
+
+  (definstruction vand_vv
+    (mnemonic VAND_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 2) (func7 2)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vand.vv $vd, $vs1, $vs2")
+    (semantics "Bitwise and; element width and lane count both come from vtype")
+    (formal (and vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Bitwise and"))
+
+  (definstruction vor_vv
+    (mnemonic VOR_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 3) (func7 3)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vor.vv $vd, $vs1, $vs2")
+    (semantics "Bitwise or; element width and lane count both come from vtype")
+    (formal (or vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Bitwise or"))
+
+  (definstruction vxor_vv
+    (mnemonic VXOR_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 4) (func7 4)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vxor.vv $vd, $vs1, $vs2")
+    (semantics "Bitwise xor; element width and lane count both come from vtype")
+    (formal (xor vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Bitwise xor"))
+
+  (definstruction vmul_vv
+    (mnemonic VMUL_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 5) (func7 5)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vmul.vv $vd, $vs1, $vs2")
+    (semantics "Multiply, low half; element width and lane count both come from vtype")
+    (formal (mul vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Multiply, low half"))
+
+  (definstruction vmax_vv
+    (mnemonic VMAX_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 6) (func7 6)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vmax.vv $vd, $vs1, $vs2")
+    (semantics "Signed maximum; element width and lane count both come from vtype")
+    (formal (max vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Signed maximum"))
+
+  (definstruction vminu_vv
+    (mnemonic VMINU_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 7) (func7 7)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vminu.vv $vd, $vs1, $vs2")
+    (semantics "Unsigned minimum; element width and lane count both come from vtype")
+    (formal (minu vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Unsigned minimum"))
+
+  (definstruction vwadd_vv
+    (mnemonic VWADD_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 0) (func7 8)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vwadd.vv $vd, $vs1, $vs2")
+    (semantics "Widening signed add; element width and lane count both come from vtype")
+    (formal (vwadd vtiw vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening signed add"))
+
+  (definstruction vwaddu_vv
+    (mnemonic VWADDU_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 1) (func7 9)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vwaddu.vv $vd, $vs1, $vs2")
+    (semantics "Widening unsigned add; element width and lane count both come from vtype")
+    (formal (vwaddu vtiw vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening unsigned add"))
+
+  (definstruction vwsub_vv
+    (mnemonic VWSUB_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 2) (func7 10)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vwsub.vv $vd, $vs1, $vs2")
+    (semantics "Widening signed subtract; element width and lane count both come from vtype")
+    (formal (vwsub vtiw vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening signed subtract"))
+
+  (definstruction vwmul_vv
+    (mnemonic VWMUL_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 3) (func7 11)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vwmul.vv $vd, $vs1, $vs2")
+    (semantics "Widening signed multiply; element width and lane count both come from vtype")
+    (formal (vwmul vtiw vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening signed multiply"))
+
+  (definstruction vwmulu_vv
+    (mnemonic VWMULU_VV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 4) (func7 12)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vwmulu.vv $vd, $vs1, $vs2")
+    (semantics "Widening unsigned multiply; element width and lane count both come from vtype")
+    (formal (vwmulu vtiw vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening unsigned multiply"))
+
+  (definstruction vnsrl_wv
+    (mnemonic VNSRL_WV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 5) (func7 13)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vnsrl.wv $vd, $vs1, $vs2")
+    (semantics "Narrowing logical shift right; element width and lane count both come from vtype")
+    (formal (vnsrl vti vtiw vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Narrowing logical shift right"))
+
+  (definstruction vnsra_wv
+    (mnemonic VNSRA_WV) (isa rvv_like) (category simd) (format RVV_R)
+    (opcode 87) (func3 6) (func7 14)
+    (operands (vd reg i64 out) (vs1 reg i64 in) (vs2 reg i64 in))
+    (asm "vnsra.wv $vd, $vs1, $vs2")
+    (semantics "Narrowing arithmetic shift right; element width and lane count both come from vtype")
+    (formal (vnsra vti vtiw vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Narrowing arithmetic shift right"))
+)

@@ -1,0 +1,168 @@
+; Lane-wise IEEE-754 SIMD (stage F2 of docs/simd_fp_design.md).
+;
+; F2 is the composition of two things that already existed: the lane machinery
+; from V1 and the scalar float semantics from F1. Nothing here is new — the lane
+; extraction is bit-vector work either way, because an AXIS float is a bit
+; pattern, so the only thing the element domain changes is the type atom the
+; per-lane operator is given. `v2f32` hands each lane to `fadd f32`.
+;
+; These are the AArch64 NEON floating-point shapes: 2S and 4S (single) and 2D
+; (double). Comparisons are deliberately absent: an AArch64 lane-wise compare
+; writes a lane mask of all-ones or all-zeros, not the 1/0 the scalar `fcmp_*`
+; operators return, so spelling one as a lane-wise `fcmp` would mean the wrong
+; thing.
+(axis-module simd_fp_lanes
+  (version "0.1.0")
+  (target rvmt)
+  (description "Lane-wise IEEE-754 SIMD over 64- and 128-bit vector registers")
+
+  (defisa simdfp
+    (base rv64im)
+    (word-bits 64)
+    (registers "v[32]:i128" "pc:i64")
+    (features simd float custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat SIMD_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (vn 19 15)
+      (vm 24 20)
+      (func7 31 25)))
+
+  (definstruction fadd_2s
+    (mnemonic VFADD_2S) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (vd reg128 i64 out element) (vn reg128 i64 in element) (vm reg128 i64 in element))
+    (asm "vfadd.2s $vd, $vn, $vm")
+    (semantics "Lane-wise single-precision over two 32-bit lanes")
+    (formal (fadd v2f32 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise single-precision over two 32-bit lanes"))
+
+  (definstruction fsub_2s
+    (mnemonic VFSUB_2S) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 0) (func7 1)
+    (operands (vd reg128 i64 out element) (vn reg128 i64 in element) (vm reg128 i64 in element))
+    (asm "vfsub.2s $vd, $vn, $vm")
+    (semantics "Lane-wise single-precision over two 32-bit lanes")
+    (formal (fsub v2f32 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise single-precision over two 32-bit lanes"))
+
+  (definstruction fmul_2s
+    (mnemonic VFMUL_2S) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 0) (func7 2)
+    (operands (vd reg128 i64 out element) (vn reg128 i64 in element) (vm reg128 i64 in element))
+    (asm "vfmul.2s $vd, $vn, $vm")
+    (semantics "Lane-wise single-precision over two 32-bit lanes")
+    (formal (fmul v2f32 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise single-precision over two 32-bit lanes"))
+
+  (definstruction fdiv_2s
+    (mnemonic VFDIV_2S) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 0) (func7 3)
+    (operands (vd reg128 i64 out element) (vn reg128 i64 in element) (vm reg128 i64 in element))
+    (asm "vfdiv.2s $vd, $vn, $vm")
+    (semantics "Lane-wise single-precision over two 32-bit lanes")
+    (formal (fdiv v2f32 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise single-precision over two 32-bit lanes"))
+
+  (definstruction fsqrt_2s
+    (mnemonic VFSQRT_2S) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 0) (func7 4) (encoding (vm 0))
+    (operands (vd reg128 i64 out element) (vn reg128 i64 in element))
+    (asm "vfsqrt.2s $vd, $vn")
+    (semantics "Lane-wise single-precision square root, correctly rounded per lane")
+    (formal (fsqrt v2f32 vn))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise single-precision square root, correctly rounded per lane"))
+
+  (definstruction fadd_4s
+    (mnemonic VFADD_4S) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (vd reg128 i128 out) (vn reg128 i128 in) (vm reg128 i128 in))
+    (asm "vfadd.4s $vd, $vn, $vm")
+    (semantics "Lane-wise single-precision over four 32-bit lanes")
+    (formal (fadd v4f32 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise single-precision over four 32-bit lanes"))
+
+  (definstruction fsub_4s
+    (mnemonic VFSUB_4S) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 1) (func7 1)
+    (operands (vd reg128 i128 out) (vn reg128 i128 in) (vm reg128 i128 in))
+    (asm "vfsub.4s $vd, $vn, $vm")
+    (semantics "Lane-wise single-precision over four 32-bit lanes")
+    (formal (fsub v4f32 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise single-precision over four 32-bit lanes"))
+
+  (definstruction fmul_4s
+    (mnemonic VFMUL_4S) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 1) (func7 2)
+    (operands (vd reg128 i128 out) (vn reg128 i128 in) (vm reg128 i128 in))
+    (asm "vfmul.4s $vd, $vn, $vm")
+    (semantics "Lane-wise single-precision over four 32-bit lanes")
+    (formal (fmul v4f32 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise single-precision over four 32-bit lanes"))
+
+  (definstruction fadd_2d
+    (mnemonic VFADD_2D) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 2) (func7 0)
+    (operands (vd reg128 i128 out) (vn reg128 i128 in) (vm reg128 i128 in))
+    (asm "vfadd.2d $vd, $vn, $vm")
+    (semantics "Lane-wise double-precision over two 64-bit lanes")
+    (formal (fadd v2f64 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise double-precision over two 64-bit lanes"))
+
+  (definstruction fmul_2d
+    (mnemonic VFMUL_2D) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 2) (func7 1)
+    (operands (vd reg128 i128 out) (vn reg128 i128 in) (vm reg128 i128 in))
+    (asm "vfmul.2d $vd, $vn, $vm")
+    (semantics "Lane-wise double-precision over two 64-bit lanes")
+    (formal (fmul v2f64 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise double-precision over two 64-bit lanes"))
+
+  (definstruction fdiv_2d
+    (mnemonic VFDIV_2D) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 2) (func7 2)
+    (operands (vd reg128 i128 out) (vn reg128 i128 in) (vm reg128 i128 in))
+    (asm "vfdiv.2d $vd, $vn, $vm")
+    (semantics "Lane-wise double-precision over two 64-bit lanes")
+    (formal (fdiv v2f64 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise double-precision over two 64-bit lanes"))
+
+  (definstruction fsqrt_2d
+    (mnemonic VFSQRT_2D) (isa simdfp) (category simd) (format SIMD_R)
+    (opcode 11) (func3 2) (func7 4) (encoding (vm 0))
+    (operands (vd reg128 i128 out) (vn reg128 i128 in))
+    (asm "vfsqrt.2d $vd, $vn")
+    (semantics "Lane-wise double-precision square root, correctly rounded per lane")
+    (formal (fsqrt v2f64 vn))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 6.0) (expected-speedup 2.0)
+    (rationale "Lane-wise double-precision square root, correctly rounded per lane"))
+)

@@ -1,0 +1,305 @@
+; Scalar IEEE-754 arithmetic (stage F1 of docs/simd_fp_design.md).
+;
+; FP values cross AXIS as bit patterns: `fadd`/`fsub`/`fmul`/`fdiv` reinterpret
+; their bit-vector arguments as floats of the operator's width, compute in
+; round-to-nearest-even, and return the result's bit pattern. A NaN result is
+; AXIS's canonical quiet NaN, specified here rather than inherited from the host,
+; so the golden model, C, Rust, and LLVM agree bit-for-bit on any platform.
+;
+; SMT lowers these through z3's FloatingPoint theory, so smt_vs_golden proves
+; them rather than sampling. FMADD_D and FMULADD_D are the fused and unfused
+; multiply-add: one rounding versus two. They differ on a witness input, which
+; tools/fp_fusion_check.py checks, and the generated code cannot be contracted
+; into agreement because the intermediate round-trips through a bit pattern.
+; `fsqrt` and `fma` come from libm in C, so a float-using header needs `-lm`.
+(axis-module fp_scalar
+  (version "0.1.0")
+  (target rvmt)
+  (description "Scalar IEEE-754 arithmetic, square root, fused multiply-add, comparisons, and conversions")
+
+  (defisa fp64_axis
+    (base rv64im)
+    (word-bits 64)
+    (registers "f[32]:i64" "pc:i64" "fpcc:i4")
+    (features fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defisa fp32_axis
+    (base rv32im)
+    (word-bits 32)
+    (registers "s[32]:i32" "pc:i32" "fpcc:i4")
+    (features fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat FP_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (fd 11 7)
+      (func3 14 12)
+      (fn1 19 15)
+      (fm 24 20)
+      (func7 31 25)))
+
+  ; --- double precision -------------------------------------------------
+  (definstruction fadd_d
+    (mnemonic FADD_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (fd reg i64 out) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fadd.d $fd, $fn1, $fm")
+    (semantics "IEEE-754 double addition, round-to-nearest-even")
+    (formal (fadd f64 fn1 fm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 8000.0) (power-estimate-mw 9.0) (expected-speedup 1.0)
+    (rationale "Smallest instruction that pins the float value domain and the canonical-NaN rule."))
+
+  (definstruction fsub_d
+    (mnemonic FSUB_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (fd reg i64 out) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fsub.d $fd, $fn1, $fm")
+    (semantics "IEEE-754 double subtraction")
+    (formal (fsub f64 fn1 fm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 8000.0) (power-estimate-mw 9.0) (expected-speedup 1.0)
+    (rationale "Distinguishes operand order and the signed-zero rules from addition."))
+
+  (definstruction fmul_d
+    (mnemonic FMUL_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 2) (func7 0)
+    (operands (fd reg i64 out) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fmul.d $fd, $fn1, $fm")
+    (semantics "IEEE-754 double multiplication")
+    (formal (fmul f64 fn1 fm))
+    (latency 5) (throughput 1.0)
+    (area-estimate-um2 12000.0) (power-estimate-mw 14.0) (expected-speedup 1.0)
+    (rationale "Exercises overflow to infinity and underflow to subnormals."))
+
+  (definstruction fdiv_d
+    (mnemonic FDIV_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 3) (func7 0)
+    (operands (fd reg i64 out) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fdiv.d $fd, $fn1, $fm")
+    (semantics "IEEE-754 double division, including the divide-by-zero infinities")
+    (formal (fdiv f64 fn1 fm))
+    (latency 15) (throughput 0.2)
+    (area-estimate-um2 20000.0) (power-estimate-mw 22.0) (expected-speedup 1.0)
+    (rationale "Division by zero returns a signed infinity, and 0/0 a NaN; both must be specified, not raised."))
+
+  (definstruction fsqrt_d
+    (mnemonic FSQRT_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 7) (func7 0)
+    (operands (fd reg i64 out) (fn1 reg i64 in))
+    (encoding (fm 0))
+    (asm "fsqrt.d $fd, $fn1")
+    (semantics "Correctly-rounded IEEE-754 double square root; a negative operand yields NaN")
+    (formal (fsqrt f64 fn1))
+    (latency 20) (throughput 0.1)
+    (area-estimate-um2 18000.0) (power-estimate-mw 20.0) (expected-speedup 1.0)
+    (rationale "Square root is correctly rounded, so an approximation would diverge from the golden model."))
+
+  (definstruction fmadd_d
+    (mnemonic FMADD_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 0) (func7 1)
+    (operands (fd reg i64 inout) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fmadd.d $fd, $fn1, $fm")
+    (semantics "Fused multiply-add: fd = fn1 * fm + fd with a single rounding")
+    (formal (fma f64 fn1 fm fd))
+    (latency 5) (throughput 1.0)
+    (area-estimate-um2 14000.0) (power-estimate-mw 16.0) (expected-speedup 1.0)
+    (rationale "One rounding, not two. The distinction is observable, so it is spelled rather than left to a compiler's contraction choice."))
+
+  (definstruction fmuladd_d
+    (mnemonic FMULADD_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 1) (func7 1)
+    (operands (fd reg i64 inout) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fmuladd.d $fd, $fn1, $fm")
+    (semantics "Unfused multiply then add: two roundings, deliberately distinct from FMADD_D")
+    (formal (fadd f64 (fmul f64 fn1 fm) fd))
+    (latency 9) (throughput 1.0)
+    (area-estimate-um2 20000.0) (power-estimate-mw 22.0) (expected-speedup 1.0)
+    (rationale "The companion to FMADD_D: proving these two disagree on a witness input is what shows no backend silently contracts."))
+
+  ; --- comparisons ------------------------------------------------------
+  (definstruction fcmpeq_d
+    (mnemonic FCMPEQ_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 2) (func7 1)
+    (operands (fd reg i64 out) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fcmpeq.d $fd, $fn1, $fm")
+    (semantics "1 if the operands are equal and neither is NaN, else 0; -0.0 equals +0.0")
+    (formal (fcmp_oeq f64 fn1 fm))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 3000.0) (power-estimate-mw 3.0) (expected-speedup 1.0)
+    (rationale "A bit comparison would get -0.0 == +0.0 and NaN != NaN both wrong."))
+
+  (definstruction fcmplt_d
+    (mnemonic FCMPLT_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 3) (func7 1)
+    (operands (fd reg i64 out) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fcmplt.d $fd, $fn1, $fm")
+    (semantics "1 if the first operand is less than the second and neither is NaN")
+    (formal (fcmp_olt f64 fn1 fm))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 3000.0) (power-estimate-mw 3.0) (expected-speedup 1.0)
+    (rationale "Ordered less-than is false for NaN on either side, unlike an integer compare."))
+
+  (definstruction fcmple_d
+    (mnemonic FCMPLE_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 4) (func7 1)
+    (operands (fd reg i64 out) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fcmple.d $fd, $fn1, $fm")
+    (semantics "1 if the first operand is less than or equal to the second and neither is NaN")
+    (formal (fcmp_ole f64 fn1 fm))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 3000.0) (power-estimate-mw 3.0) (expected-speedup 1.0)
+    (rationale "Distinguished from less-than at equality, including across signed zeros."))
+
+  (definstruction fcmpuno_d
+    (mnemonic FCMPUNO_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 5) (func7 1)
+    (operands (fd reg i64 out) (fn1 reg i64 in) (fm reg i64 in))
+    (asm "fcmpuno.d $fd, $fn1, $fm")
+    (semantics "1 if either operand is NaN, so the comparison is unordered")
+    (formal (fcmp_uno f64 fn1 fm))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 2500.0) (power-estimate-mw 2.5) (expected-speedup 1.0)
+    (rationale "The predicate that makes unorderedness observable rather than implicit in the ordered forms being false."))
+
+  ; --- conversions ------------------------------------------------------
+  ; Float to integer rounds toward zero and saturates, with NaN mapping to 0.
+  ; That rule is AXIS's, not the host's: a C cast is undefined out of range,
+  ; ARM saturates, and x86 returns the most negative integer.
+  (definstruction fcvtzs_d
+    (mnemonic FCVTZS_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 6) (func7 1)
+    (operands (fd reg i64 out) (fn1 reg i64 in))
+    (encoding (fm 0))
+    (asm "fcvtzs.d $fd, $fn1")
+    (semantics "Double to signed 64-bit integer, toward zero, saturating, NaN to 0")
+    (formal (fcvt_f2s i64 64 fn1))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 6000.0) (power-estimate-mw 7.0) (expected-speedup 1.0)
+    (rationale "The out-of-range result is architecture-specific, so leaving it unstated would mean something different on each backend."))
+
+  (definstruction fcvtzu_d
+    (mnemonic FCVTZU_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 7) (func7 1)
+    (operands (fd reg i64 out) (fn1 reg i64 in))
+    (encoding (fm 0))
+    (asm "fcvtzu.d $fd, $fn1")
+    (semantics "Double to unsigned 64-bit integer, toward zero, saturating, NaN and negatives to 0")
+    (formal (fcvt_f2u i64 64 fn1))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 6000.0) (power-estimate-mw 7.0) (expected-speedup 1.0)
+    (rationale "The unsigned form clamps at zero from below, which the signed form does not."))
+
+  (definstruction scvtf_d
+    (mnemonic SCVTF_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 0) (func7 2)
+    (operands (fd reg i64 out) (fn1 reg i64 in))
+    (encoding (fm 0))
+    (asm "scvtf.d $fd, $fn1")
+    (semantics "Signed 64-bit integer to double, round-to-nearest-even")
+    (formal (fcvt_s2f f64 64 fn1))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 6000.0) (power-estimate-mw 7.0) (expected-speedup 1.0)
+    (rationale "A 64-bit integer has more significand bits than a double, so this rounds and is not a reinterpretation."))
+
+  (definstruction ucvtf_d
+    (mnemonic UCVTF_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 1) (func7 2)
+    (operands (fd reg i64 out) (fn1 reg i64 in))
+    (encoding (fm 0))
+    (asm "ucvtf.d $fd, $fn1")
+    (semantics "Unsigned 64-bit integer to double, round-to-nearest-even")
+    (formal (fcvt_u2f f64 64 fn1))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 6000.0) (power-estimate-mw 7.0) (expected-speedup 1.0)
+    (rationale "Distinguishes the unsigned interpretation of the same bits from the signed one."))
+
+  (definstruction fcvt_d2s
+    (mnemonic FCVT_D2S) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 2) (func7 2)
+    (operands (fd reg i64 out) (fn1 reg i64 in))
+    (encoding (fm 0))
+    (asm "fcvt.d2s $fd, $fn1")
+    (semantics "Double narrowed to single, round-to-nearest-even, overflowing to an infinity")
+    (formal (fcvt_f2f f32 64 fn1))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 4.5) (expected-speedup 1.0)
+    (rationale "Narrowing rounds and can overflow; widening, its inverse, is exact."))
+
+  ; --- comparisons that write condition-code state ----------------------
+  ; The first *effectful* FP instructions: a comparison whose result goes to
+  ; architectural state rather than a register, which is how real ISAs spell it
+  ; (AArch64 FCMP writes NZCV). The four-bit encoding is AArch64's:
+  ; unordered = 0b0011, equal = 0b0110, less = 0b1000, greater = 0b0010.
+  (definstruction fcmps_s
+    (mnemonic FCMPS_S) (isa fp32_axis) (category float) (format FP_R)
+    (opcode 11) (func3 7) (func7 2)
+    (operands (fn1 reg i32 in) (fm reg i32 in))
+    (encoding (fd 0))
+    (asm "fcmps.s $fn1, $fm")
+    (semantics "Compare two singles and write the four-bit float condition code")
+    (behavior
+      (setstate fpcc
+        (if i32 (fcmp_uno f32 fn1 fm) 3
+          (if i32 (fcmp_oeq f32 fn1 fm) 6
+            (if i32 (fcmp_olt f32 fn1 fm) 8 2)))
+        i4))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 3500.0) (power-estimate-mw 3.5) (expected-speedup 1.0)
+    (rationale "An FP comparison whose result is state, not a value: the unordered case needs its own encoding rather than falling out of the ordered ones being false."))
+
+  (definstruction fcmps_d
+    (mnemonic FCMPS_D) (isa fp64_axis) (category float) (format FP_R)
+    (opcode 11) (func3 3) (func7 2)
+    (operands (fn1 reg i64 in) (fm reg i64 in))
+    (encoding (fd 0))
+    (asm "fcmps.d $fn1, $fm")
+    (semantics "Compare two doubles and write the four-bit float condition code")
+    (behavior
+      (setstate fpcc
+        (if i64 (fcmp_uno f64 fn1 fm) 3
+          (if i64 (fcmp_oeq f64 fn1 fm) 6
+            (if i64 (fcmp_olt f64 fn1 fm) 8 2)))
+        i4))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 3500.0) (power-estimate-mw 3.5) (expected-speedup 1.0)
+    (rationale "The double-precision form exercises the wide executor ABI's effect lowering, which had no float operators before."))
+
+  ; --- single precision -------------------------------------------------
+  (definstruction fadd_s
+    (mnemonic FADD_S) (isa fp32_axis) (category float) (format FP_R)
+    (opcode 11) (func3 4) (func7 0)
+    (operands (fd reg i32 out) (fn1 reg i32 in) (fm reg i32 in))
+    (asm "fadd.s $fd, $fn1, $fm")
+    (semantics "IEEE-754 single addition, round-to-nearest-even")
+    (formal (fadd f32 fn1 fm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 5000.0) (power-estimate-mw 6.0) (expected-speedup 1.0)
+    (rationale "Single precision rounds to 24 significand bits, so it catches a backend that computed in double."))
+
+  (definstruction fmul_s
+    (mnemonic FMUL_S) (isa fp32_axis) (category float) (format FP_R)
+    (opcode 11) (func3 5) (func7 0)
+    (operands (fd reg i32 out) (fn1 reg i32 in) (fm reg i32 in))
+    (asm "fmul.s $fd, $fn1, $fm")
+    (semantics "IEEE-754 single multiplication")
+    (formal (fmul f32 fn1 fm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 7000.0) (power-estimate-mw 8.0) (expected-speedup 1.0)
+    (rationale "A double-precision multiply then narrowed would double-round and disagree here."))
+
+  (definstruction fdiv_s
+    (mnemonic FDIV_S) (isa fp32_axis) (category float) (format FP_R)
+    (opcode 11) (func3 6) (func7 0)
+    (operands (fd reg i32 out) (fn1 reg i32 in) (fm reg i32 in))
+    (asm "fdiv.s $fd, $fn1, $fm")
+    (semantics "IEEE-754 single division")
+    (formal (fdiv f32 fn1 fm))
+    (latency 12) (throughput 0.2)
+    (area-estimate-um2 14000.0) (power-estimate-mw 15.0) (expected-speedup 1.0)
+    (rationale "Single-precision division exposes both narrowing and the zero-divisor rules.")))

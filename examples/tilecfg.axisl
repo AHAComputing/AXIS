@@ -1,0 +1,101 @@
+; A configuration read from memory (docs/tensor_design.md, T5).
+;
+; AMX's LDTILECFG reads 64 bytes -- a palette byte, a start row, eight column
+; counts and eight row counts -- and every tile instruction after it is shaped
+; by what that block said. The design called this the one place the existing
+; mode machinery does not reach, because a mode's parameters come from a CSR
+; field.
+;
+; ⚠️ Measured before building anything: the SEMANTICS were never the problem.
+; An instruction that reads a block and writes sixteen configuration slots
+; validates and emits through every backend today -- sixteen `setstate`s from
+; sixteen loads, no ceiling reached. What was missing is that nothing SAID
+; those slots were a configuration, nothing published where in the block each
+; one lives, and nothing tied the block to the shape the document is
+; elaborated at. A runtime that had to build the block would have read byte
+; offsets out of an effect expression.
+;
+; So `defconfig` declares a layout the semantics already imply, and the two are
+; REQUIRED TO AGREE. `(configures tilecfg)` is what ties them: validation walks
+; every declared field, finds the state write that establishes it, and refuses
+; a description whose load reads byte 47 where the declaration says 48. A
+; declaration nothing checks is a comment.
+;
+; The instantiation is the other half. A description is static, so it is
+; elaborated at ONE configuration -- and rather than leaving that to be inferred
+; from the shapes elsewhere in the document, it is named here, from the values
+; the architecture allows. A value the machine cannot be put into is refused
+; with the list it is not in.
+(axis-module tilecfg
+  (version "0.1.0")
+  (target rvmt)
+  (description "A memory-resident tile configuration and the instruction that establishes it")
+
+  (defisa amx
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64"
+               "palette:i8" "start_row:i8"
+               "tile0_rows:i8" "tile1_rows:i8"
+               "tile0_colsb:i16" "tile1_colsb:i16")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defconfig tilecfg
+    (bytes 64)
+    (field palette (at 0) (width 1) (values 0 1))
+    (field start_row (at 1) (width 1) (values 0))
+    (field tile0_colsb (at 16) (width 2) (values 4 8 16 32 64))
+    (field tile1_colsb (at 18) (width 2) (values 4 8 16 32 64))
+    (field tile0_rows (at 48) (width 1) (values 1 2 4 8 16))
+    (field tile1_rows (at 49) (width 1) (values 1 2 4 8 16))
+    (instantiate (palette 1) (start_row 0)
+                 (tile0_colsb 64) (tile1_colsb 64)
+                 (tile0_rows 16) (tile1_rows 16))
+    (description "Palette 1 with two 16-row, 64-byte tiles, which is AMX's full shape"))
+
+  (defformat AMX_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction ldtilecfg
+    (mnemonic LDTILECFG) (isa amx) (category custom) (format AMX_R)
+    (opcode 11) (func3 0) (func7 0)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 reg i64 in))
+    (asm "ldtilecfg ($rs1)")
+    (semantics "Establish the tile configuration from a 64-byte block")
+    (configures tilecfg)
+    (behavior
+      (setstate palette (load i8 unsigned rs1) i8)
+      (setstate start_row (load i8 unsigned (add i64 rs1 1)) i8)
+      (setstate tile0_colsb (load i16 unsigned (add i64 rs1 16)) i16)
+      (setstate tile1_colsb (load i16 unsigned (add i64 rs1 18)) i16)
+      (setstate tile0_rows (load i8 unsigned (add i64 rs1 48)) i8)
+      (setstate tile1_rows (load i8 unsigned (add i64 rs1 49)) i8))
+    (latency 12) (throughput 0.2)
+    (area-estimate-um2 3000.0) (power-estimate-mw 4.0) (expected-speedup 1.0)
+    (rationale "The block is read once and every tile instruction after it is shaped by it"))
+
+  (definstruction tilerelease
+    (mnemonic TILERELEASE) (isa amx) (category custom) (format AMX_R)
+    (opcode 11) (func3 1) (func7 0)
+    (encoding (rd 0) (rs1 0) (rs2 0))
+    (operands)
+    (asm "tilerelease")
+    (semantics "Return every tile to the unconfigured state")
+    (behavior
+      (setstate palette 0 i8)
+      (setstate tile0_rows 0 i8)
+      (setstate tile1_rows 0 i8))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 200.0) (power-estimate-mw 0.3) (expected-speedup 1.0)
+    (rationale "Deliberately does NOT carry `configures`: it establishes nothing, it clears"))
+)

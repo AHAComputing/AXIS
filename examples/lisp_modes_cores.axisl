@@ -1,0 +1,169 @@
+; Modes gate shared encodings while cores describe the execution topology.
+(axis-module lisp-modes-cores
+  (version "0.2.0")
+  (target rvmt)
+
+  (defisa rv32-axis
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features m custom))
+
+  (defmode field-mode
+    (csr 0x7c0)
+    (field 1 0)
+    (values
+      (scalar 0)
+      (simt 1)
+      (xnn 2))
+    (default scalar)
+    (description "PCE-field execution-mode selector"))
+
+  (defsem multiply-word
+    ((lhs i32) (rhs i32))
+    i32
+    (mul i32 lhs rhs))
+
+  ; These instructions intentionally share an encoding. Their mode sets are
+  ; disjoint, so decode remains unambiguous for a selected mode.
+  (definstruction SCALAR-ADD
+    (mnemonic SCALAR_ADD)
+    (isa rv32-axis)
+    (format R)
+    (opcode 0x0b)
+    (func3 0)
+    (func7 0)
+    (use-properties single-cycle)
+    (modes scalar simt)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (semantics "Add two scalar registers")
+    (formal (add i32 rs1 rs2))
+    (rationale "Scalar and SIMT personalities share this encoding"))
+
+  (definstruction TENSOR-MUL
+    (mnemonic TENSOR_MUL)
+    (isa rv32-axis)
+    (format R)
+    (opcode 0x0b)
+    (func3 0)
+    (func7 0)
+    (use-properties single-cycle)
+    (modes xnn)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (semantics "Multiply two tensor-lane registers")
+    (formal (mul i32 rs1 rs2))
+    (rationale "XNN reuses the scalar encoding in a disjoint mode"))
+
+  ; A unique encoding restricted to one mode exercises illegal-in-mode decode.
+  (definstruction SIMT-SPECIAL
+    (mnemonic SIMT_SPECIAL)
+    (isa rv32-axis)
+    (format R)
+    (opcode 0x0b)
+    (func3 2)
+    (func7 0)
+    (use-properties single-cycle)
+    (modes simt)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (semantics "Subtract two lockstep-lane registers")
+    (formal (sub i32 rs1 rs2))
+    (rationale "Exercises illegal-in-mode decode for a unique word"))
+
+  (defpersonality scalar1
+    (mode scalar)
+    (implements rv32-axis)
+    (discipline independent (threads 1))
+    (capsule "x[32]" pc)
+    (description "Single-thread scalar personality"))
+
+  (defpersonality simt8
+    (mode simt)
+    (implements rv32-axis)
+    (discipline lockstep (lanes 8))
+    (capsule "x[32]" pc)
+    (description "Eight-lane lockstep personality"))
+
+  (defpersonality xnn0
+    (mode xnn)
+    (implements rv32-axis)
+    (discipline systolic (rows 8) (cols 8))
+    (capsule "x[32]" pc)
+    (description "Eight-by-eight systolic personality"))
+
+  (defcore pce-tile0
+    (kind rvmt)
+    (threads 8)
+    (implements rv32-axis)
+    (personalities scalar1 simt8 xnn0)
+    (features mode-switch custom))
+
+  (defmemory l1
+    (kind sram)
+    (size-bytes 32768)
+    (ports 2)
+    (latency-cycles 1)
+    (width-bits 32)
+    (banks 1)
+    (attributes cache coherent))
+
+  (defmemory scratchpad
+    (kind scratchpad)
+    (size-bytes 65536)
+    (ports 2)
+    (latency-cycles 1)
+    (width-bits 32)
+    (banks 4)
+    (attributes explicit dma-visible))
+
+  (defaccelerator nearasic0
+    (family nearasic)
+    (subtype vector-multiply)
+    (descriptor-version 1)
+    (descriptor-schema rvmt_nearasic_v1)
+    (descriptor-bytes 68)
+    (launch-abi rvmt_submit_entry)
+    (completion status_addr)
+    (target nearasic)
+    (coupling queue_descriptor)
+    (use-properties accelerator-runtime)
+    (element-width-bits 32)
+    (ports
+      (a input bits i32)
+      (b input bits i32)
+      (y output bits i32))
+    (semantics "Multiply two input words")
+    (formal (multiply-word a b))
+    (use-properties accelerator-cost))
+
+  (deftile rvmt-tile0
+    (cores pce-tile0)
+    (accelerators nearasic0)
+    (memories l1 scratchpad)
+    (interconnect crossbar))
+
+  ; Fragments may be declared after use. Nested fragments splice in place and
+  ; remain ordinary typed properties after bounded expansion.
+  (defproperties single-cycle
+    (latency 1)
+    (throughput 1.0))
+
+  (defproperties accelerator-runtime
+    (profile scalar)
+    (backend-kind auto)
+    (exec-shape scalar)
+    (simd-lanes 1)
+    (fallback-policy software))
+
+  (defproperties accelerator-cost
+    (use-properties single-cycle)
+    (latency 4)
+    (resources lanes=1)))

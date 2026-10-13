@@ -1,0 +1,138 @@
+; Contractions: a fold whose terms are independent (docs/tensor_design.md, T6b).
+;
+; `iterate` carries an accumulator from one step to the next, so its
+; association is fixed by meaning -- a carry chain is what it is. An
+; accumulation's terms do not depend on each other, and that restriction is the
+; whole point: it is what makes the association free, and therefore choosable.
+;
+;   (accumulate <type> <op> (<index> <count>) (order <order>) <term>)
+;
+; Three orders, and the difference between them is not style:
+;
+;   sequential  left to right, one level of nesting per step
+;   pairwise    a balanced tree, log2(count) levels
+;   exact       any association, because the operator is associative AND the
+;               accumulator is wide enough that no partial result is lost
+;
+; `exact` is an obligation, not a label. DOT_I8_64 sums 64 products of
+; sign-extended bytes: 16 bits of product, 6 of count, one of sign is 23, which
+; an i32 holds with nine to spare -- so every association gives one answer and
+; the elaborator folds in halves. Narrow that accumulator to i16 and the
+; description is refused with the arithmetic rather than rounded quietly.
+;
+; DOT_I8_1024 is the instruction that could not exist a commit ago. A left fold
+; of 1024 terms nests 1024 deep, `semantics::MAX_EXPR_DEPTH` refuses anything
+; past 400, and before that guard it aborted `emit-llvm-ir` with a stack
+; overflow. The same 1024 terms folded in halves are eleven levels deep and
+; every backend emits them.
+;
+; The float pair is here to show the other side: FADD_SEQ and FADD_PAIR are the
+; same terms in the two orders, and they are DIFFERENT INSTRUCTIONS. Floating
+; point has no `exact` -- an order is what the value is -- and
+; tools/contraction_check.py requires the two to disagree on some input, since
+; an order declaration no input can tell apart is a declaration about nothing.
+;
+; The terms are synthetic: a real contraction reads its operands from memory or
+; from a wide register, and a corpus about the FOLD should not need either. The
+; index selects a byte cyclically, which is enough to make every term distinct
+; and to exercise the obligation.
+(axis-module contraction
+  (version "0.1.0")
+  (target rvmt)
+  (description "Accumulations: independent terms, and the orders they may fold in")
+
+  (defisa dot32
+    (base rv64im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat D_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction dot_i8_4
+    (mnemonic DOT_I8_4) (isa dot32) (category alu) (format D_R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (rd reg i32 out) (rs1 reg i32 in) (rs2 reg i32 in))
+    (asm "dot_i8_4 $rd, $rs1, $rs2")
+    (semantics "Four signed byte products summed into a word")
+    (formal (accumulate i32 add (k 4) (order exact)
+      (mul i32 (sext i32 8 (lshr i32 rs1 (mul i32 k 8)))
+               (sext i32 8 (lshr i32 rs2 (mul i32 k 8))))))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.2) (expected-speedup 4.0)
+    (rationale "The real shape: four bytes in a word, products summed exactly"))
+
+  (definstruction dot_i8_64
+    (mnemonic DOT_I8_64) (isa dot32) (category alu) (format D_R)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (rd reg i32 out) (rs1 reg i32 in) (rs2 reg i32 in))
+    (asm "dot_i8_64 $rd, $rs1, $rs2")
+    (semantics "Sixty-four signed byte products, AMX's contraction depth")
+    (formal (accumulate i32 add (k 64) (order exact)
+      (mul i32 (sext i32 8 (lshr i32 rs1 (and i32 (mul i32 k 8) 24)))
+               (sext i32 8 (lshr i32 rs2 (and i32 (mul i32 k 8) 24))))))
+    (latency 6) (throughput 1.0)
+    (area-estimate-um2 9000.0) (power-estimate-mw 11.0) (expected-speedup 16.0)
+    (rationale "K = 64 is AMX's depth, and 23 bits of it fit an i32 with room"))
+
+  (definstruction dot_i8_1024
+    (mnemonic DOT_I8_1024) (isa dot32) (category alu) (format D_R)
+    (opcode 11) (func3 2) (func7 0)
+    (operands (rd reg i32 out) (rs1 reg i32 in) (rs2 reg i32 in))
+    (asm "dot_i8_1024 $rd, $rs1, $rs2")
+    (semantics "A thousand products, folded in halves so the depth is eleven")
+    (formal (accumulate i32 add (k 1024) (order exact)
+      (mul i32 (sext i32 8 (lshr i32 rs1 (and i32 (mul i32 k 8) 24)))
+               (sext i32 8 (lshr i32 rs2 (and i32 (mul i32 k 8) 24))))))
+    (latency 20) (throughput 0.5)
+    (area-estimate-um2 40000.0) (power-estimate-mw 60.0) (expected-speedup 64.0)
+    (rationale "The instruction the depth guard refused as a left fold"))
+
+  (definstruction and_reduce
+    (mnemonic AND_REDUCE) (isa dot32) (category alu) (format D_R)
+    (opcode 11) (func3 3) (func7 0)
+    (encoding (rs2 0))
+    (operands (rd reg i32 out) (rs1 reg i32 in))
+    (asm "and_reduce $rd, $rs1")
+    (semantics "Every rotation of the operand, folded with and")
+    (formal (accumulate i32 and (k 32) (order exact) (lshr i32 rs1 k)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "A bitwise fold cannot leave its width, so exact costs it nothing to claim"))
+
+  (definstruction fadd_seq
+    (mnemonic FADD_SEQ) (isa dot32) (category float) (format D_R)
+    (opcode 11) (func3 4) (func7 0)
+    (encoding (rs2 0))
+    (operands (rd reg i32 out) (rs1 reg i32 in))
+    (asm "fadd_seq $rd, $rs1")
+    (semantics "Eight single-precision terms summed left to right")
+    (formal (accumulate f32 fadd (k 8) (order sequential)
+      (fmul f32 rs1 (add i32 1065353216 (shl i32 k 20)))))
+    (latency 8) (throughput 0.5)
+    (area-estimate-um2 5000.0) (power-estimate-mw 7.0) (expected-speedup 1.0)
+    (rationale "The order is the value, so it is written down"))
+
+  (definstruction fadd_pair
+    (mnemonic FADD_PAIR) (isa dot32) (category float) (format D_R)
+    (opcode 11) (func3 5) (func7 0)
+    (encoding (rs2 0))
+    (operands (rd reg i32 out) (rs1 reg i32 in))
+    (asm "fadd_pair $rd, $rs1")
+    (semantics "The same eight terms summed as a balanced tree")
+    (formal (accumulate f32 fadd (k 8) (order pairwise)
+      (fmul f32 rs1 (add i32 1065353216 (shl i32 k 20)))))
+    (latency 5) (throughput 1.0)
+    (area-estimate-um2 5200.0) (power-estimate-mw 7.4) (expected-speedup 1.6)
+    (rationale "A different instruction from the one above, not a faster spelling of it"))
+)

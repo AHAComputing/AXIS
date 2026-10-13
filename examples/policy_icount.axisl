@@ -1,0 +1,75 @@
+; ICOUNT thread selection -- the second policy expressed as an accelerator.
+;
+; `policy_accelerator.axisl` showed a cache victim choice is a pure function of committed state and
+; therefore an accelerator. This is the other decision that shape was claimed to cover: which of N
+; hardware threads issues this cycle. It is here because a measurement asked for it -- an 8-wide SMT
+; machine beats four 2-wide slices on mixed workloads, and a STATIC equal-share window cap costs
+; throughput once threads are plentiful, so what the machine needs is a dynamic policy.
+;
+; ICOUNT (Tullsen, Eggers, Levy, MICRO 1996) picks the thread with the FEWEST instructions in flight
+; ahead of issue: a thread whose front end is healthy is rewarded, and a thread piling up work it
+; cannot issue is not. Two things are folded into the same score rather than bolted around it:
+;
+;   * a STALLED thread must never win, whatever its count -- an I-cache miss or a full queue makes
+;     its low in-flight count a lie about its readiness;
+;   * among threads with equal counts the one waiting LONGEST wins. Without that term the comparator
+;     is a strict inequality, ties fall to the lower-numbered candidate, and the selector degenerates
+;     into fixed priority -- which is exactly the defect this platform already found in the barrel
+;     core's scheduler, where it starved threads 2 and 3.
+;
+; The score is minimised, so `icount_select_2` answers 1 to take the right candidate when the right
+; candidate scores LOWER. That is the opposite of the victim-selection example, and it is the only
+; difference between an argmin and an argmax as far as the reduction over N is concerned.
+(axis-module policy_icount
+  (version "0.1.0")
+  (target rvmt)
+  (description "ICOUNT thread selection as a pure scored decision over typed ports")
+
+  (defisa policy_host
+    (word-bits 32)
+    (registers "x[32]:i32")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; A module needs an instruction; the policy is the accelerator. Kept trivial on purpose.
+  (definstruction policy_nop
+    (mnemonic POLICY_NOP)
+    (category custom)
+    (format R)
+    (opcode 0x5b) (func3 7) (func7 0x7f) (encoding (rs2 0))
+    (operands (rd reg i32 out) (rs1 reg i32 in))
+    (asm "policy.nop $rd, $rs1")
+    (semantics "identity")
+    (formal rs1)
+    (latency 1) (throughput 1.0))
+
+  ; The learnable part, and the only place weights live. Fields are packed so one unsigned compare
+  ; orders them: stalled dominates everything, then in-flight count, then waiting time as the
+  ; tie-break. `255 - since_served` inverts the last field so the whole score is minimised and stays
+  ; non-negative, which is what lets the comparator be an unsigned compare.
+  (defsem icount_score ((inflight i32) (stalled i32) (since_served i32)) i32
+    (add i32
+      (add i32 (shl i32 stalled 24) (shl i32 inflight 8))
+      (sub i32 255 since_served)))
+
+  (defaccelerator icount_select_2
+    (family policy)
+    (subtype thread_select)
+    (ports
+      (inflight0 in scalar i32)
+      (stalled0 in scalar i32)
+      (since0 in scalar i32)
+      (inflight1 in scalar i32)
+      (stalled1 in scalar i32)
+      (since1 in scalar i32)
+      (winner out scalar i32))
+    (semantics "argmin of icount_score over two candidate threads; ties keep the left candidate")
+    (formal
+      (if i32
+        (icmp_ult i32 (icount_score inflight1 stalled1 since1)
+                      (icount_score inflight0 stalled0 since0))
+        1
+        0))
+    (latency 1)
+    (throughput "1.0")))

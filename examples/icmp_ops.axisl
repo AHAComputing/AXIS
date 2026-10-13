@@ -1,0 +1,75 @@
+; Integer comparisons as values (the operators RISC-V needs and AArch64 did not).
+;
+; AArch64 compares by writing NZCV and testing it, so comparison lived in the
+; ISA-specific helpers `a64_sub_nzcv` and `a64_cond_holds`. RISC-V has no flags:
+; `slt` is an arithmetic instruction and the branches compare registers
+; directly. A second ISA is what made these necessary.
+;
+; The six here are exactly RISC-V's branch set. The missing directions -- sgt,
+; sle and their unsigned twins -- are these same operators with the operands
+; swapped, so they are omitted rather than duplicated.
+(axis-module icmp_ops
+  (version "0.1.0")
+  (target rvmt)
+  (description "Integer comparisons producing 0 or 1")
+
+  (defisa cmp32
+    (base rv32i)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (definstruction-family icmp-family
+    ; The assembly text comes per row rather than from `$name`, which is the
+    ; declaration's identifier and spells nothing anyone would write. The
+    ; template used to interpolate `$name` into the text and the expander did
+    ; not substitute inside strings, so the emitted description published
+    ; `$name $rd, $rs1, $rs2` as this instruction's assembly.
+    ($name $mnemonic $func3 $op $asm)
+    ((SLT-EQ SLT_EQ 0 icmp_eq "slt.eq $rd, $rs1, $rs2")
+     (SLT-NE SLT_NE 1 icmp_ne "slt.ne $rd, $rs1, $rs2")
+     (SLT-S SLT_S 2 icmp_slt "slt.s $rd, $rs1, $rs2")
+     (SGE-S SGE_S 3 icmp_sge "sge.s $rd, $rs1, $rs2")
+     (SLT-U SLT_U 4 icmp_ult "slt.u $rd, $rs1, $rs2")
+     (SGE-U SGE_U 5 icmp_uge "sge.u $rd, $rs1, $rs2"))
+    (definstruction $name
+      (mnemonic $mnemonic)
+      (isa cmp32)
+      (format R)
+      (opcode 0x33)
+      (func3 $func3)
+      (func7 0)
+      (operands
+        (rd reg i32 out)
+        (rs1 reg i32 in)
+        (rs2 reg i32 in))
+      (asm $asm)
+      (semantics "Set $rd to 1 when the comparison holds, 0 otherwise")
+      (formal ($op i32 rs1 rs2))
+      (latency 1) (throughput 1.0)
+      (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+      (rationale "RISC-V compares registers directly; there are no flags to test")))
+
+  ; A narrower comparison reads its operands at its own width, so a negative
+  ; 16-bit value compares by its own sign bit rather than the word's.
+  (definstruction SLT-S16
+    (mnemonic SLT_S16)
+    (isa cmp32)
+    (format R)
+    (opcode 0x33)
+    (func3 6)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "slt.s16 $rd, $rs1, $rs2")
+    (semantics "Signed comparison of the low 16 bits")
+    ; The comparison result carries the operator's width, as `fcmp_*` does, so
+    ; widening to the destination is written rather than implied.
+    (formal (zext i32 16 (icmp_slt i16 rs1 rs2)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Pins that a signed comparison reads the operator's width, not the register's")))

@@ -1,0 +1,84 @@
+(axis-module xhet
+  (version "1.0")
+  (target rvmt)
+  (description "Heterogeneous tile manifest carrying ISA and system metadata")
+
+  (definstruction simt_enqueue
+    (mnemonic SIMT_ENQ)
+    (description "Enqueue work to a SIMT target from an RVMT host thread")
+    (category custom)
+    (format R)
+    (opcode 91)
+    (func3 0)
+    (func7 32) (encoding (rd 0))
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+    )
+    (semantics "enqueue_simt(rs1, rs2)")
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 900.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.6)
+    (intrinsic llvm.pce.simt.enqueue)
+    (patterns simt_dispatch heterogeneous_tile)
+    (applicable-patterns simt_dispatch heterogeneous_tile)
+    (rationale "Models RVMT-to-SIMT dispatch so AHA can reason about heterogeneous tile offload.")
+  )
+
+  (defcore rvmt_host
+    (kind rvmt)
+    (threads 4)
+    (features m atomics barriers)
+  )
+
+  (defcore simt0
+    (kind simt)
+    (threads 32)
+    (features warp shared_memory)
+  )
+
+  ; The multi-context surface (M1), matching what the consumer of this
+  ; description keeps by hand in `xnn_mt/contract.py`: sixteen retained
+  ; contexts, an id wide enough to name every one of them, and an issue queue
+  ; that can hold a prefetched issue behind the one being serviced. The
+  ; relations between these numbers are what the validator decides; the numbers
+  ; themselves are what the engine is.
+  (defaccelerator xnn0
+    (family xnn)
+    (subtype stream)
+    (contexts 16)
+    (context-id-bits 4)
+    (issue-queue-depth 2)
+    (identity context_id tenant_id domain_id command_id)
+    (scheduling work-conserving-round-robin)
+    (preemption tile-boundary-only)
+    (service-interval-cycles 91)
+    (eligibility descriptor_valid weights_ready activations_ready
+                 result_credit tenant_enabled not_faulted not_cancelled)
+    (descriptor-version 1)
+    (descriptor-bytes 0)
+    (mmio-base 0)
+    (mmio-size 0)
+    (target xnn)
+    (coupling queue_descriptor)
+    (region-id 0)
+    (manifest-version 0)
+    (profile scalar)
+    (backend-kind auto)
+    (exec-shape scalar)
+    (simd-lanes 1)
+    (element-width-bits 0)
+    (fallback-policy software)
+    (latency 1)
+    (throughput 1.0)
+  )
+
+  (deftile hetero0
+    (cores rvmt_host simt0)
+    (accelerators xnn0)
+    (memories l2 scratchpad stream_buffer)
+    (interconnect noc)
+  )
+)

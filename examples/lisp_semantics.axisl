@@ -1,0 +1,43 @@
+(axis-module lisp_semantics
+  (version "0.1.0")
+  (target generic)
+  (description "Lisp-authored compositional semantics over the typed AXIS core")
+
+  (defformat SELECT_R4
+    (bits 32)
+    (fields
+      (func2 31 30)
+      (rs3 29 25)
+      (rs2 24 20)
+      (rs1 19 15)
+      (func3 14 12)
+      (rd 11 7)
+      (opcode 6 0)
+    )
+  )
+
+  (definstruction select_sum_or_difference
+    (mnemonic SELECT_SUM_OR_DIFFERENCE)
+    (category custom)
+    (format SELECT_R4)
+    (opcode 11)
+    (func3 0)
+    (func7 0)
+    (encoding (opcode 11) (func3 0) (func2 0))
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (rs3 reg i32 in)
+    )
+    (asm "select.sum.diff $rd, $rs1, $rs2, $rs3")
+    (semantics "Bind sum and difference once, then select using a nonzero condition")
+    (formal (let ((sum (add i32 rs2 rs3)) (difference (sub i32 rs2 rs3))) (if i32 rs1 sum difference)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Exercises lexical bindings and typed conditional values in the Lisp semantic layer")
+  )
+)

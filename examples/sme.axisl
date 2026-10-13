@@ -1,0 +1,363 @@
+;; S1: SME's outer products (docs/accelerator_design.md).
+;;
+;; ZA tile .S at SVL = 512 is 16 x 16 single-precision elements, and every
+;; instruction here updates one: FMOPA and FMOPS (fused, one rounding --
+;; Arm's FPMulAdd per element), and the widening integer family SMOPA,
+;; UMOPA, SUMOPA, USMOPA and SMOPS, which add FOUR i8 products into each i32.
+;; Each is merging-predicated by two predicates: pn governs the rows and pm the
+;; columns, so element (i, j) changes only where both are active.
+;;
+;; An outer product is a row broadcast times a column broadcast (T3's `vrows`
+;; and `vcols`), and a widening one reads byte t of each 32-bit element with a
+;; shift and an extension -- no new operator. What S1 had to add was smaller:
+;; `fma`, `fneg`, `sext` and `zext` were not on the lane-local lists, so a
+;; fused outer product could only have been written as `fadd` of `fmul`, which
+;; rounds twice and is not what the machine does.
+;;
+;; The geometry is SME's at SVL = 512 (S2a). Z and P are 512 bits; ZA is one
+;; array of 64 rows of 512 bits, and a tile is a VIEW of it: row i of ZA<n>.S
+;; is ZA row 4i+n, of ZA<n>.D row 8i+n. The classes `za_s` and `za_d` are those
+;; views -- the same file, with a group step of 4 and of 8 -- so an FMOPA into
+;; ZA1.D changes rows that ZA1.S also names (ZA row 9 is ZA1.D's row 1 and
+;; ZA1.S's row 2), and tools/sme_check.py holds both against ONE array.
+;; A tile operation is typed `mn<elem>`: (SVL / elem)^2 lanes, 256 for .S.
+;;
+;; A predicate is one byte lane per predicate bit: pn as i32 elements puts the
+;; bits for bytes 4i..4i+3 in element i. A .S element is active when its
+;; lowest bit is, which is Arm's rule; a widening product governs each source
+;; byte by its own bit, which is also Arm's rule.
+;;
+;; Slices (S2b): MOVA moves one row (H) or column (V) of a tile, chosen at RUN
+;; time by a general register plus an immediate, modulo the tile's 16 -- to a
+;; tile from a Z register, or from a tile to one, merging by a governing
+;; predicate. A write needs no new addressing: as a whole-tile operation each
+;; lane knows its own row (`vrow`) or column (`vcol`) and changes only where it
+;; equals the slice. A read is a select over the 16 candidate slices
+;; (`vslice`, `vslicev`). The slice register is W12-W15, as Arm's two-bit
+;; field names it.
+;;
+;; Slices to and from memory (S2c): LD1W and ST1W move one slice between a
+;; tile and Xn|SP + (Xm << 2). A load writes an active element from memory and
+;; an inactive one with ZERO (Arm's /Z) -- two guarded effects, so memory is
+;; read only where the predicate is active; a store writes active elements and
+;; no others, one guarded store per element.
+;;
+;; Not yet: BFMOPA and the widening FMOPA (f16 -> f32), which need Arm's
+;; intermediate rounding modelled on purpose.
+(axis-module sme
+  (version "0.1.0")
+  (target rvmt)
+  (description "SME outer products: FMOPA/FMOPS and the widening integer family, into ZA tiles")
+
+  (defisa sme
+    (base armv8-a)
+    (word-bits 64)
+    (vector-bits 512)
+    (registers "z[32]:i512" "pc:i64")
+    (features simd scalable predicated fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; Arm's encodings (Arm ARM, SME), field for field. Each instruction pins
+  ; its fixed bits with `encoding`; `tools/sme_asl_check.py` requires every
+  ; word the gate builds to be the word `llvm-mc` assembles for it.
+  ;   FMOPA/FMOPS .S  10000000100 Zm Pm Pn Zn S 00 ZAda[1:0]
+  ;   FMOPA/FMOPS .D  10000000110 Zm Pm Pn Zn S 0  ZAda[2:0]
+  ;   SMOPA family    1010000 u0 10 u1 Zm Pm Pn Zn S 00 ZAda  (u = unsigned, S = subtract)
+  ;   MOVA Z -> tile  11000000 10 00000 0 V Rs Pg Zn 0 ZAd off2
+  ;   MOVA tile -> Z  11000000 10 00001 0 V Rs Pg 0 ZAn off2 Zd
+  ;   LD1W/ST1W ZA    1110000010 st Rm V Rs Pg Rn 0 ZAt off2   (address Xn|SP + Xm << 2)
+  ; Rs names W12-W15, which the `a64_w12` class reads as register 12 + Rs.
+  (defformat SME_FMOPA_S
+    (bits 32)
+    (fields (fixed 31 21) (zm 20 16) (pm 15 13) (pn 12 10) (zn 9 5) (s 4) (fixed3 3 2) (za 1 0)))
+
+  (defformat SME_FMOPA_D
+    (bits 32)
+    (fields (fixed 31 21) (zm 20 16) (pm 15 13) (pn 12 10) (zn 9 5) (s 4) (fixed3 3) (za 2 0)))
+
+  (defformat SME_IMOPA
+    (bits 32)
+    (fields (fixed 31 25) (u0 24) (fixed2 23 22) (u1 21) (zm 20 16) (pm 15 13) (pn 12 10)
+            (zn 9 5) (s 4) (fixed3 3 2) (za 1 0)))
+
+  (defformat SME_MOVA_ZT
+    (bits 32)
+    (fields (fixed 31 24) (size 23 22) (fixed2 21 17) (q 16) (v 15) (ws 14 13) (pg 12 10)
+            (zn 9 5) (fixed3 4) (za 3 2) (imm 1 0)))
+
+  (defformat SME_MOVA_TZ
+    (bits 32)
+    (fields (fixed 31 24) (size 23 22) (fixed2 21 17) (q 16) (v 15) (ws 14 13) (pg 12 10)
+            (fixed3 9) (za 8 7) (imm 6 5) (zn 4 0)))
+
+  (defformat SME_LDST_S
+    (bits 32)
+    (fields (fixed 31 22) (st 21) (xm 20 16) (v 15) (ws 14 13) (pg 12 10) (xn 9 5)
+            (fixed2 4) (za 3 2) (imm 1 0)))
+
+  (definstruction fmopa_s
+    (mnemonic FMOPA_S) (isa sme) (category simd) (format SME_FMOPA_S)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 1028) (s 0) (fixed3 0))
+    (operands (za za_s i32 inout) (zn vreg i32 in) (zm vreg i32 in) (pn preg i32 in) (pm preg i32 in))
+    (asm "fmopa_s $za, $pn, $pm, $zn, $zm")
+    (semantics "ZA[i][j] = fma(zn[i], zm[j], ZA[i][j]) where pn[i] and pm[j]; single precision")
+    (formal
+      (vmerge mnf32 (and mni32 (and mni32 (vrows mni32 16 pn) (vcols mni32 16 pm)) 1)
+        (fma mnf32 (vrows mnf32 16 zn) (vcols mnf32 16 zm) za)
+        za))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 16.0)
+    (rationale "Arm's non-widening FMOPA is FPMulAdd per element: fused, one rounding"))
+
+  (definstruction fmops_s
+    (mnemonic FMOPS_S) (isa sme) (category simd) (format SME_FMOPA_S)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 1028) (s 1) (fixed3 0))
+    (operands (za za_s i32 inout) (zn vreg i32 in) (zm vreg i32 in) (pn preg i32 in) (pm preg i32 in))
+    (asm "fmops_s $za, $pn, $pm, $zn, $zm")
+    (semantics "ZA[i][j] = fma(-zn[i], zm[j], ZA[i][j]) where pn[i] and pm[j]")
+    (formal
+      (vmerge mnf32 (and mni32 (and mni32 (vrows mni32 16 pn) (vcols mni32 16 pm)) 1)
+        (fma mnf32 (fneg mnf32 (vrows mnf32 16 zn)) (vcols mnf32 16 zm) za)
+        za))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 16.0)
+    (rationale "The product negated before the fused add, as FMOPS does"))
+
+  (definstruction smopa_s
+    (mnemonic SMOPA_S) (isa sme) (category simd) (format SME_IMOPA)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 80) (u0 0) (fixed2 2) (u1 0) (s 0) (fixed3 0))
+    (operands (za za_s i32 inout) (zn vreg i32 in) (zm vreg i32 in) (pn preg i32 in) (pm preg i32 in))
+    (asm "smopa_s $za, $pn, $pm, $zn, $zm")
+    (semantics "ZA[i][j] += sum over t<4 of zn.b[4i+t] * zm.b[4j+t], signed by signed, each byte governed by its own predicate bit")
+    (formal
+      (add mni32 za
+        (add mni32 (add mni32 (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 0)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 0) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 0)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 0) 1)))
+                   (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 8)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 8) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 8)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 8) 1))))
+        (add mni32 (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 16)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 16) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 16)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 16) 1)))
+                   (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 24)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 24) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 24)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 24) 1)))))))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 16.0)
+    (rationale "Four i8 products per i32: the widening outer product, exact in integers"))
+
+  (definstruction umopa_s
+    (mnemonic UMOPA_S) (isa sme) (category simd) (format SME_IMOPA)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 80) (u0 1) (fixed2 2) (u1 1) (s 0) (fixed3 0))
+    (operands (za za_s i32 inout) (zn vreg i32 in) (zm vreg i32 in) (pn preg i32 in) (pm preg i32 in))
+    (asm "umopa_s $za, $pn, $pm, $zn, $zm")
+    (semantics "ZA[i][j] += sum over t<4 of zn.b[4i+t] * zm.b[4j+t], unsigned by unsigned, each byte governed by its own predicate bit")
+    (formal
+      (add mni32 za
+        (add mni32 (add mni32 (mul mni32 (mul mni32 (zext mni32 8 (lshr mni32 (vrows mni32 16 zn) 0)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 0) 1))
+                   (mul mni32 (zext mni32 8 (lshr mni32 (vcols mni32 16 zm) 0)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 0) 1)))
+                   (mul mni32 (mul mni32 (zext mni32 8 (lshr mni32 (vrows mni32 16 zn) 8)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 8) 1))
+                   (mul mni32 (zext mni32 8 (lshr mni32 (vcols mni32 16 zm) 8)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 8) 1))))
+        (add mni32 (mul mni32 (mul mni32 (zext mni32 8 (lshr mni32 (vrows mni32 16 zn) 16)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 16) 1))
+                   (mul mni32 (zext mni32 8 (lshr mni32 (vcols mni32 16 zm) 16)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 16) 1)))
+                   (mul mni32 (mul mni32 (zext mni32 8 (lshr mni32 (vrows mni32 16 zn) 24)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 24) 1))
+                   (mul mni32 (zext mni32 8 (lshr mni32 (vcols mni32 16 zm) 24)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 24) 1)))))))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 16.0)
+    (rationale "Four i8 products per i32: the widening outer product, exact in integers"))
+
+  (definstruction sumopa_s
+    (mnemonic SUMOPA_S) (isa sme) (category simd) (format SME_IMOPA)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 80) (u0 0) (fixed2 2) (u1 1) (s 0) (fixed3 0))
+    (operands (za za_s i32 inout) (zn vreg i32 in) (zm vreg i32 in) (pn preg i32 in) (pm preg i32 in))
+    (asm "sumopa_s $za, $pn, $pm, $zn, $zm")
+    (semantics "ZA[i][j] += sum over t<4 of zn.b[4i+t] * zm.b[4j+t], signed zn by unsigned zm, each byte governed by its own predicate bit")
+    (formal
+      (add mni32 za
+        (add mni32 (add mni32 (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 0)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 0) 1))
+                   (mul mni32 (zext mni32 8 (lshr mni32 (vcols mni32 16 zm) 0)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 0) 1)))
+                   (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 8)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 8) 1))
+                   (mul mni32 (zext mni32 8 (lshr mni32 (vcols mni32 16 zm) 8)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 8) 1))))
+        (add mni32 (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 16)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 16) 1))
+                   (mul mni32 (zext mni32 8 (lshr mni32 (vcols mni32 16 zm) 16)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 16) 1)))
+                   (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 24)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 24) 1))
+                   (mul mni32 (zext mni32 8 (lshr mni32 (vcols mni32 16 zm) 24)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 24) 1)))))))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 16.0)
+    (rationale "Four i8 products per i32: the widening outer product, exact in integers"))
+
+  (definstruction usmopa_s
+    (mnemonic USMOPA_S) (isa sme) (category simd) (format SME_IMOPA)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 80) (u0 1) (fixed2 2) (u1 0) (s 0) (fixed3 0))
+    (operands (za za_s i32 inout) (zn vreg i32 in) (zm vreg i32 in) (pn preg i32 in) (pm preg i32 in))
+    (asm "usmopa_s $za, $pn, $pm, $zn, $zm")
+    (semantics "ZA[i][j] += sum over t<4 of zn.b[4i+t] * zm.b[4j+t], unsigned zn by signed zm, each byte governed by its own predicate bit")
+    (formal
+      (add mni32 za
+        (add mni32 (add mni32 (mul mni32 (mul mni32 (zext mni32 8 (lshr mni32 (vrows mni32 16 zn) 0)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 0) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 0)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 0) 1)))
+                   (mul mni32 (mul mni32 (zext mni32 8 (lshr mni32 (vrows mni32 16 zn) 8)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 8) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 8)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 8) 1))))
+        (add mni32 (mul mni32 (mul mni32 (zext mni32 8 (lshr mni32 (vrows mni32 16 zn) 16)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 16) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 16)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 16) 1)))
+                   (mul mni32 (mul mni32 (zext mni32 8 (lshr mni32 (vrows mni32 16 zn) 24)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 24) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 24)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 24) 1)))))))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 16.0)
+    (rationale "Four i8 products per i32: the widening outer product, exact in integers"))
+
+  (definstruction smops_s
+    (mnemonic SMOPS_S) (isa sme) (category simd) (format SME_IMOPA)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 80) (u0 0) (fixed2 2) (u1 0) (s 1) (fixed3 0))
+    (operands (za za_s i32 inout) (zn vreg i32 in) (zm vreg i32 in) (pn preg i32 in) (pm preg i32 in))
+    (asm "smops_s $za, $pn, $pm, $zn, $zm")
+    (semantics "ZA[i][j] -= sum over t<4 of zn.b[4i+t] * zm.b[4j+t], signed")
+    (formal
+      (sub mni32 za
+        (add mni32 (add mni32 (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 0)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 0) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 0)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 0) 1)))
+                   (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 8)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 8) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 8)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 8) 1))))
+        (add mni32 (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 16)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 16) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 16)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 16) 1)))
+                   (mul mni32 (mul mni32 (sext mni32 8 (lshr mni32 (vrows mni32 16 zn) 24)) (and mni32 (lshr mni32 (vrows mni32 16 pn) 24) 1))
+                   (mul mni32 (sext mni32 8 (lshr mni32 (vcols mni32 16 zm) 24)) (and mni32 (lshr mni32 (vcols mni32 16 pm) 24) 1)))))))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 16.0)
+    (rationale "The subtracting form of SMOPA"))
+  (definstruction fmopa_d
+    (mnemonic FMOPA_D) (isa sme) (category simd) (format SME_FMOPA_D)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 1030) (s 0) (fixed3 0))
+    (operands (za za_d i64 inout) (zn vreg i64 in) (zm vreg i64 in) (pn preg i64 in) (pm preg i64 in))
+    (asm "fmopa_d $za, $pn, $pm, $zn, $zm")
+    (semantics "ZA<n>.D[i][j] = fma(zn[i], zm[j], ZA<n>.D[i][j]) where pn[i] and pm[j]; double precision, 8 x 8")
+    (formal
+      (vmerge mnf64 (and mni64 (and mni64 (vrows mni64 8 pn) (vcols mni64 8 pm)) 1)
+        (fma mnf64 (vrows mnf64 8 zn) (vcols mnf64 8 zm) za)
+        za))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 8.0)
+    (rationale "Eight .D tiles interleave at a step of eight: the same array, another view"))
+
+  (definstruction mova_zth
+    (mnemonic MOVA_ZTH) (isa sme) (category simd) (format SME_MOVA_ZT)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 192) (size 2) (fixed2 0) (q 0) (v 0) (fixed3 0))
+    (operands (za za_s i32 inout) (ws a64_w12 i32 in) (imm imm i2 in) (pg preg i32 in) (zn vreg i32 in))
+    (asm "mova_zth $za, $ws, $imm, $pg, $zn")
+    (semantics "ZA<n>H.S[ws+imm] = zn where pg")
+    (formal
+      (vmerge mni32 (icmp_eq mni32 (vrow mni32 16) (vdup mni32 (and i32 (add i32 ws imm) 15)))
+        (vmerge mni32 (and mni32 (vcols mni32 16 pg) 1) (vcols mni32 16 zn) za)
+        za))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A slice chosen at run time"))
+
+  (definstruction mova_ztv
+    (mnemonic MOVA_ZTV) (isa sme) (category simd) (format SME_MOVA_ZT)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 192) (size 2) (fixed2 0) (q 0) (v 1) (fixed3 0))
+    (operands (za za_s i32 inout) (ws a64_w12 i32 in) (imm imm i2 in) (pg preg i32 in) (zn vreg i32 in))
+    (asm "mova_ztv $za, $ws, $imm, $pg, $zn")
+    (semantics "ZA<n>V.S[ws+imm] = zn where pg")
+    (formal
+      (vmerge mni32 (icmp_eq mni32 (vcol mni32 16) (vdup mni32 (and i32 (add i32 ws imm) 15)))
+        (vmerge mni32 (and mni32 (vrows mni32 16 pg) 1) (vrows mni32 16 zn) za)
+        za))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A slice chosen at run time"))
+
+  (definstruction mova_tzh
+    (mnemonic MOVA_TZH) (isa sme) (category simd) (format SME_MOVA_TZ)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 192) (size 2) (fixed2 1) (q 0) (v 0) (fixed3 0))
+    (operands (zn vreg i32 inout) (za za_s i32 in) (ws a64_w12 i32 in) (imm imm i2 in) (pg preg i32 in))
+    (asm "mova_tzh $za, $ws, $imm, $pg, $zn")
+    (semantics "zn = ZA<n>H.S[ws+imm] where pg")
+    (formal
+      (vmerge vni32 (and vni32 pg 1) (vslice vni32 16 za (and i32 (add i32 ws imm) 15)) zn))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A slice chosen at run time"))
+
+  (definstruction mova_tzv
+    (mnemonic MOVA_TZV) (isa sme) (category simd) (format SME_MOVA_TZ)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 192) (size 2) (fixed2 1) (q 0) (v 1) (fixed3 0))
+    (operands (zn vreg i32 inout) (za za_s i32 in) (ws a64_w12 i32 in) (imm imm i2 in) (pg preg i32 in))
+    (asm "mova_tzv $za, $ws, $imm, $pg, $zn")
+    (semantics "zn = ZA<n>V.S[ws+imm] where pg")
+    (formal
+      (vmerge vni32 (and vni32 pg 1) (vslicev vni32 16 za (and i32 (add i32 ws imm) 15)) zn))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A slice chosen at run time"))
+
+  (definstruction ld1w_h
+    (mnemonic LD1W_H) (isa sme) (category simd) (format SME_LDST_S)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 898) (st 0) (v 0) (fixed2 0))
+    (operands (za za_s i32 inout) (ws a64_w12 i32 in) (imm imm i2 in) (pg preg i32 in) (xn a64_gpr64sp i64 in) (xm a64_gpr64 i64 in))
+    (asm "ld1w_h $za, $ws, $imm, $pg, $xn, $xm")
+    (semantics "ZA<n>H.S[ws+imm][e] = active(pg, e) ? Mem32[xn + (xm << 2) + 4e] : 0")
+    (behavior
+      (when (and (eq (vrow mni32 16) (vdup mni32 (and i32 (add i32 ws imm) 15))) (ne (and mni32 (vcols mni32 16 pg) 1) 0))
+        (set za (vload_map mni32 (add i64 xn (shl i64 xm 2)) (dim 16 0) (dim 16 4))))
+      (when (and (eq (vrow mni32 16) (vdup mni32 (and i32 (add i32 ws imm) 15))) (eq (and mni32 (vcols mni32 16 pg) 1) 0))
+        (set za 0)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A tile slice to or from memory, only where the predicate is active"))
+
+  (definstruction ld1w_v
+    (mnemonic LD1W_V) (isa sme) (category simd) (format SME_LDST_S)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 898) (st 0) (v 1) (fixed2 0))
+    (operands (za za_s i32 inout) (ws a64_w12 i32 in) (imm imm i2 in) (pg preg i32 in) (xn a64_gpr64sp i64 in) (xm a64_gpr64 i64 in))
+    (asm "ld1w_v $za, $ws, $imm, $pg, $xn, $xm")
+    (semantics "ZA<n>V.S[ws+imm][e] = active(pg, e) ? Mem32[xn + (xm << 2) + 4e] : 0")
+    (behavior
+      (when (and (eq (vcol mni32 16) (vdup mni32 (and i32 (add i32 ws imm) 15))) (ne (and mni32 (vrows mni32 16 pg) 1) 0))
+        (set za (vload_map mni32 (add i64 xn (shl i64 xm 2)) (dim 16 4) (dim 16 0))))
+      (when (and (eq (vcol mni32 16) (vdup mni32 (and i32 (add i32 ws imm) 15))) (eq (and mni32 (vrows mni32 16 pg) 1) 0))
+        (set za 0)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A tile slice to or from memory, only where the predicate is active"))
+
+  (definstruction st1w_h
+    (mnemonic ST1W_H) (isa sme) (category simd) (format SME_LDST_S)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 898) (st 1) (v 0) (fixed2 0))
+    (operands (za za_s i32 in) (ws a64_w12 i32 in) (imm imm i2 in) (pg preg i32 in) (xn a64_gpr64sp i64 in) (xm a64_gpr64 i64 in))
+    (asm "st1w_h $za, $ws, $imm, $pg, $xn, $xm")
+    (semantics "Mem32[xn + (xm << 2) + 4e] = ZA<n>H.S[ws+imm][e] for active e")
+    (behavior
+      (when (ne (and vni32 pg 1) 0)
+        (store (vaddr vni32 (add i64 xn (shl i64 xm 2))) (vslice vni32 16 za (and i32 (add i32 ws imm) 15)) i32)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A tile slice to or from memory, only where the predicate is active"))
+
+  (definstruction st1w_v
+    (mnemonic ST1W_V) (isa sme) (category simd) (format SME_LDST_S)
+    (opcode 0) (func3 0) (func7 0)
+    (encoding (fixed 898) (st 1) (v 1) (fixed2 0))
+    (operands (za za_s i32 in) (ws a64_w12 i32 in) (imm imm i2 in) (pg preg i32 in) (xn a64_gpr64sp i64 in) (xm a64_gpr64 i64 in))
+    (asm "st1w_v $za, $ws, $imm, $pg, $xn, $xm")
+    (semantics "Mem32[xn + (xm << 2) + 4e] = ZA<n>V.S[ws+imm][e] for active e")
+    (behavior
+      (when (ne (and vni32 pg 1) 0)
+        (store (vaddr vni32 (add i64 xn (shl i64 xm 2))) (vslicev vni32 16 za (and i32 (add i32 ws imm) 15)) i32)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A tile slice to or from memory, only where the predicate is active"))
+)

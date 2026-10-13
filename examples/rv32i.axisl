@@ -1,0 +1,6187 @@
+; RV32I — the RISC-V base integer instruction set, complete.
+;
+; This is AXIS's second real ISA. The first, AArch64, shaped the language; two
+; things it never needed turned up in the first hour of writing this one:
+;
+;   * Integer comparisons as values. AArch64 compares by writing NZCV and
+;     testing it, so `slt` and the compare-branches had nothing to compute with.
+;   * A hardwired zero register. AArch64 encodes XZR as index 31 in some classes
+;     and SP in others; RISC-V's x0 is index 0 and always zero. That is now a row
+;     in the register-class table rather than a branch per architecture.
+;
+; Encodings are the real ones. The base formats R/I/S/B/U/J are built in, with
+; the scattered immediate slices RISC-V uses, so an instruction here declares its
+; opcode and function fields and nothing more.
+(axis-module rv32i
+  (version "1.0.0")
+  (target rvmt)
+  (description "RV32I base integer instruction set")
+
+  (defisa rv32i
+    (base rv32i)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32"
+      ; The reservation LR sets and SC tests. Modelling it as ISA state
+      ; rather than as a special case is what let the exclusives work with no
+      ; new mechanism.
+      "exclusive_address:i32" "exclusive_size:i8" "exclusive_valid:i1" "exclusive_value:i32" "frm:i3" "fflags:i5")
+    (features i)
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; The A extension's own layout: func5 selects the operation and the aq and rl
+  ; bits carry the ordering, the same way AArch64's A and L bits do. The built-in
+  ; R format has a seven-bit func7 spanning all three, so they need naming.
+
+  ; The floating-point layout: what the R format calls func3 is the rounding
+  ; mode, so it needs naming. RISC-V encodes the mode per instruction, which is
+  ; exactly what AXIS's mode-as-argument design was for.
+  ; RISC-V's FENCE splits the I-format immediate into `fm`, a predecessor set
+  ; and a successor set. The two sets are the barrier's option, eight bits of
+  ; it, which is why the effect model's four-bit option had to stop being
+  ; AArch64's `CRm`.
+  (defformat RV_FENCE
+    (bits 32)
+    (fields
+      (fm 31 28)
+      (option 27 20)
+      (rs1 19 15)
+      (func3 14 12)
+      (rd 11 7)
+      (opcode 6 0)))
+
+  (defformat RV_FP
+    (bits 32)
+    (fields
+      (func7 31 25)
+      (rs2 24 20)
+      (rs1 19 15)
+      (rm 14 12)
+      (rd 11 7)
+      (opcode 6 0)))
+
+  (defformat RV_AMO
+    (bits 32)
+    (fields
+      (func5 31 27)
+      (aq 26 26)
+      (rl 25 25)
+      (rs2 24 20)
+      (rs1 19 15)
+      (func3 14 12)
+      (rd 11 7)
+      (opcode 6 0)))
+
+  ; The CSR *immediate* forms put a five-bit unsigned operand where the register
+  ; forms put `rs1`. That is one field with two names -- RISC-V's own manual
+  ; calls it `uimm[4:0]` in these encodings -- and an operand binds to the field
+  ; its name matches, so describing them against `I` left the operand encoded
+  ; nowhere and the field bound to nothing. Six instructions per corpus were
+  ; therefore unencodable, which means no fixture, which means executed by
+  ; nothing: the roundtrip manifest listed them under `unencoded_operand` every
+  ; run and nothing read it.
+  (defformat RV_CSRI
+    (bits 32)
+    (fields
+      (imm 31 20)
+      (uimm 19 15)
+      (func3 14 12)
+      (rd 11 7)
+      (opcode 6 0)))
+
+
+  (definstruction LUI
+    (mnemonic LUI)
+    (isa rv32i)
+    (category custom)
+    (format U)
+    (opcode 0x37)
+    (operands
+      (rd rv_gpr i32 out)
+      (imm imm i32 in))
+    (asm "lui $rd, $imm")
+    (semantics "Load the 20-bit upper immediate; the U format already places it at bits 31:12")
+    (formal (or i32 imm 0))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Load the 20-bit upper immediate; the U format already places it at bits 31:12"))
+
+  (definstruction AUIPC
+    (mnemonic AUIPC)
+    (isa rv32i)
+    (category custom)
+    (format U)
+    (opcode 0x17)
+    (operands
+      (rd rv_gpr i32 out)
+      (imm imm i32 in))
+    (asm "auipc $rd, $imm")
+    (semantics "Add the upper immediate to the pc")
+    (behavior
+      (set rd (add i32 pc imm)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Add the upper immediate to the pc"))
+
+  (definstruction JAL
+    (mnemonic JAL)
+    (isa rv32i)
+    (category custom)
+    (format J)
+    (opcode 0x6f)
+    (operands
+      (rd rv_gpr i32 out)
+      (imm imm i32 in))
+    (asm "jal $rd, $imm")
+    (semantics "Jump and link; the J format packs a 21-bit signed offset whose low bit is always zero")
+    (behavior
+      (setpc (add i32 pc (sext i32 21 imm)))
+      (set rd (add i32 pc 4)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Jump and link; the J format packs a 21-bit signed offset whose low bit is always zero"))
+
+  (definstruction JALR
+    (mnemonic JALR)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x67)
+    (func3 0)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "jalr $rd, $rs1, $imm")
+    (semantics "Jump to rs1 plus offset with the low bit cleared, and link")
+    (behavior
+      (setpc (and i32 (add i32 rs1 (sext i32 12 imm)) 0xfffffffe))
+      (set rd (add i32 pc 4)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Jump to rs1 plus offset with the low bit cleared, and link"))
+
+  (definstruction BEQ
+    (mnemonic BEQ)
+    (isa rv32i)
+    (category custom)
+    (format B)
+    (opcode 0x63)
+    (func3 0)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "beq $rs1, $rs2, $imm")
+    (semantics "Branch when rs1 is equal rs2")
+    (behavior
+      (when (icmp_eq rs1 rs2) (setpc (add i32 pc (sext i32 13 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Branch when rs1 is equal rs2"))
+
+  (definstruction BNE
+    (mnemonic BNE)
+    (isa rv32i)
+    (category custom)
+    (format B)
+    (opcode 0x63)
+    (func3 1)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "bne $rs1, $rs2, $imm")
+    (semantics "Branch when rs1 is not equal rs2")
+    (behavior
+      (when (icmp_ne rs1 rs2) (setpc (add i32 pc (sext i32 13 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Branch when rs1 is not equal rs2"))
+
+  (definstruction BLT
+    (mnemonic BLT)
+    (isa rv32i)
+    (category custom)
+    (format B)
+    (opcode 0x63)
+    (func3 4)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "blt $rs1, $rs2, $imm")
+    (semantics "Branch when rs1 is less than, signed rs2")
+    (behavior
+      (when (icmp_slt rs1 rs2) (setpc (add i32 pc (sext i32 13 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Branch when rs1 is less than, signed rs2"))
+
+  (definstruction BGE
+    (mnemonic BGE)
+    (isa rv32i)
+    (category custom)
+    (format B)
+    (opcode 0x63)
+    (func3 5)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "bge $rs1, $rs2, $imm")
+    (semantics "Branch when rs1 is greater or equal, signed rs2")
+    (behavior
+      (when (icmp_sge rs1 rs2) (setpc (add i32 pc (sext i32 13 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Branch when rs1 is greater or equal, signed rs2"))
+
+  (definstruction BLTU
+    (mnemonic BLTU)
+    (isa rv32i)
+    (category custom)
+    (format B)
+    (opcode 0x63)
+    (func3 6)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "bltu $rs1, $rs2, $imm")
+    (semantics "Branch when rs1 is less than, unsigned rs2")
+    (behavior
+      (when (icmp_ult rs1 rs2) (setpc (add i32 pc (sext i32 13 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Branch when rs1 is less than, unsigned rs2"))
+
+  (definstruction BGEU
+    (mnemonic BGEU)
+    (isa rv32i)
+    (category custom)
+    (format B)
+    (opcode 0x63)
+    (func3 7)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "bgeu $rs1, $rs2, $imm")
+    (semantics "Branch when rs1 is greater or equal, unsigned rs2")
+    (behavior
+      (when (icmp_uge rs1 rs2) (setpc (add i32 pc (sext i32 13 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Branch when rs1 is greater or equal, unsigned rs2"))
+
+  (definstruction LB
+    (mnemonic LB)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x03)
+    (func3 0)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "lb $rd, $imm($rs1)")
+    (semantics "Load a 8-bit value, signed-extended into rd")
+    (behavior
+      (set rd (load i8 signed (add i32 rs1 (sext i32 12 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 8-bit value, signed-extended into rd"))
+
+  (definstruction LH
+    (mnemonic LH)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x03)
+    (func3 1)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "lh $rd, $imm($rs1)")
+    (semantics "Load a 16-bit value, signed-extended into rd")
+    (behavior
+      (set rd (load i16 signed (add i32 rs1 (sext i32 12 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 16-bit value, signed-extended into rd"))
+
+  (definstruction LW
+    (mnemonic LW)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x03)
+    (func3 2)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "lw $rd, $imm($rs1)")
+    (semantics "Load a 32-bit value, signed-extended into rd")
+    (behavior
+      (set rd (load i32 signed (add i32 rs1 (sext i32 12 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 32-bit value, signed-extended into rd"))
+
+  (definstruction LBU
+    (mnemonic LBU)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x03)
+    (func3 4)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "lbu $rd, $imm($rs1)")
+    (semantics "Load a 8-bit value, unsigned-extended into rd")
+    (behavior
+      (set rd (load i8 unsigned (add i32 rs1 (sext i32 12 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 8-bit value, unsigned-extended into rd"))
+
+  (definstruction LHU
+    (mnemonic LHU)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x03)
+    (func3 5)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "lhu $rd, $imm($rs1)")
+    (semantics "Load a 16-bit value, unsigned-extended into rd")
+    (behavior
+      (set rd (load i16 unsigned (add i32 rs1 (sext i32 12 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 16-bit value, unsigned-extended into rd"))
+
+  (definstruction SB
+    (mnemonic SB)
+    (isa rv32i)
+    (category custom)
+    (format S)
+    (opcode 0x23)
+    (func3 0)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "sb $rs2, $imm($rs1)")
+    (semantics "Store the low 8 bits of rs2")
+    (behavior
+      (store (add i32 rs1 (sext i32 12 imm)) rs2 i8))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Store the low 8 bits of rs2"))
+
+  (definstruction SH
+    (mnemonic SH)
+    (isa rv32i)
+    (category custom)
+    (format S)
+    (opcode 0x23)
+    (func3 1)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "sh $rs2, $imm($rs1)")
+    (semantics "Store the low 16 bits of rs2")
+    (behavior
+      (store (add i32 rs1 (sext i32 12 imm)) rs2 i16))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Store the low 16 bits of rs2"))
+
+  (definstruction SW
+    (mnemonic SW)
+    (isa rv32i)
+    (category custom)
+    (format S)
+    (opcode 0x23)
+    (func3 2)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "sw $rs2, $imm($rs1)")
+    (semantics "Store the low 32 bits of rs2")
+    (behavior
+      (store (add i32 rs1 (sext i32 12 imm)) rs2 i32))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Store the low 32 bits of rs2"))
+
+  (definstruction ADDI
+    (mnemonic ADDI)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x13)
+    (func3 0)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "addi $rd, $rs1, $imm")
+    (semantics "Add the sign-extended immediate")
+    (formal (add i32 rs1 (sext i32 12 imm)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Add the sign-extended immediate"))
+
+  (definstruction SLTI
+    (mnemonic SLTI)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x13)
+    (func3 2)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "slti $rd, $rs1, $imm")
+    (semantics "Set to 1 when rs1 is less than the immediate, signed")
+    (formal (icmp_slt i32 rs1 (sext i32 12 imm)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Set to 1 when rs1 is less than the immediate, signed"))
+
+  (definstruction SLTIU
+    (mnemonic SLTIU)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x13)
+    (func3 3)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "sltiu $rd, $rs1, $imm")
+    (semantics "Set to 1 when rs1 is less than the immediate, unsigned; the immediate is still sign-extended first")
+    (formal (icmp_ult i32 rs1 (sext i32 12 imm)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Set to 1 when rs1 is less than the immediate, unsigned; the immediate is still sign-extended first"))
+
+  (definstruction XORI
+    (mnemonic XORI)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x13)
+    (func3 4)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "xori $rd, $rs1, $imm")
+    (semantics "Exclusive-or with the sign-extended immediate")
+    (formal (xor i32 rs1 (sext i32 12 imm)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Exclusive-or with the sign-extended immediate"))
+
+  (definstruction ORI
+    (mnemonic ORI)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x13)
+    (func3 6)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "ori $rd, $rs1, $imm")
+    (semantics "Or with the sign-extended immediate")
+    (formal (or i32 rs1 (sext i32 12 imm)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Or with the sign-extended immediate"))
+
+  (definstruction ANDI
+    (mnemonic ANDI)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x13)
+    (func3 7)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "andi $rd, $rs1, $imm")
+    (semantics "And with the sign-extended immediate")
+    (formal (and i32 rs1 (sext i32 12 imm)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "And with the sign-extended immediate"))
+
+  (definstruction SLLI
+    (mnemonic SLLI)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x13)
+    (func3 1)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 imm i5 in))
+    (asm "slli $rd, $rs1, $rs2")
+    (semantics "Shift left logical by an immediate")
+    (formal (sll i32 rs1 (and i32 rs2 0x1f)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Shift left logical by an immediate"))
+
+  (definstruction SRLI
+    (mnemonic SRLI)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x13)
+    (func3 5)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 imm i5 in))
+    (asm "srli $rd, $rs1, $rs2")
+    (semantics "Shift right logical by an immediate")
+    (formal (srl i32 rs1 (and i32 rs2 0x1f)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Shift right logical by an immediate"))
+
+  (definstruction SRAI
+    (mnemonic SRAI)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x13)
+    (func3 5)
+    (func7 0x20)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 imm i5 in))
+    (asm "srai $rd, $rs1, $rs2")
+    (semantics "Shift right arithmetic by an immediate")
+    (formal (ashr i32 rs1 (and i32 rs2 0x1f)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Shift right arithmetic by an immediate"))
+
+  (definstruction ADD
+    (mnemonic ADD)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 0)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "add $rd, $rs1, $rs2")
+    (semantics "Add")
+    (formal (add i32 rs1 rs2))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Add"))
+
+  (definstruction SUB
+    (mnemonic SUB)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 0)
+    (func7 0x20)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "sub $rd, $rs1, $rs2")
+    (semantics "Subtract")
+    (formal (sub i32 rs1 rs2))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Subtract"))
+
+  (definstruction SLL
+    (mnemonic SLL)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 1)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "sll $rd, $rs1, $rs2")
+    (semantics "Shift left logical by the low five bits of rs2")
+    (formal (sll i32 rs1 (and i32 rs2 0x1f)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Shift left logical by the low five bits of rs2"))
+
+  (definstruction SLT
+    (mnemonic SLT)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 2)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "slt $rd, $rs1, $rs2")
+    (semantics "Set to 1 when rs1 is less than rs2, signed")
+    (formal (icmp_slt i32 rs1 rs2))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Set to 1 when rs1 is less than rs2, signed"))
+
+  (definstruction SLTU
+    (mnemonic SLTU)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 3)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "sltu $rd, $rs1, $rs2")
+    (semantics "Set to 1 when rs1 is less than rs2, unsigned")
+    (formal (icmp_ult i32 rs1 rs2))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Set to 1 when rs1 is less than rs2, unsigned"))
+
+  (definstruction XOR
+    (mnemonic XOR)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 4)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "xor $rd, $rs1, $rs2")
+    (semantics "Exclusive-or")
+    (formal (xor i32 rs1 rs2))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Exclusive-or"))
+
+  (definstruction SRL
+    (mnemonic SRL)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 5)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "srl $rd, $rs1, $rs2")
+    (semantics "Shift right logical by the low five bits of rs2")
+    (formal (srl i32 rs1 (and i32 rs2 0x1f)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Shift right logical by the low five bits of rs2"))
+
+  (definstruction SRA
+    (mnemonic SRA)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 5)
+    (func7 0x20)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "sra $rd, $rs1, $rs2")
+    (semantics "Shift right arithmetic by the low five bits of rs2")
+    (formal (ashr i32 rs1 (and i32 rs2 0x1f)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Shift right arithmetic by the low five bits of rs2"))
+
+  (definstruction OR
+    (mnemonic OR)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 6)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "or $rd, $rs1, $rs2")
+    (semantics "Or")
+    (formal (or i32 rs1 rs2))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Or"))
+
+  (definstruction AND
+    (mnemonic AND)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 7)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "and $rd, $rs1, $rs2")
+    (semantics "And")
+    (formal (and i32 rs1 rs2))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "And"))
+
+  ; --- M extension: multiply and divide ---------------------------------
+  ; RISC-V defines the edge cases rather than trapping: division by zero
+  ; yields all ones, the remainder by zero yields the dividend, and the most
+  ; negative value divided by minus one overflows to itself with a zero
+  ; remainder. Those are written out here because they are architecture, not
+  ; an artefact of how any backend divides.
+
+  (definstruction MUL
+    (mnemonic MUL)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 0)
+    (func7 0x01)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "mul $rd, $rs1, $rs2")
+    (semantics "Multiply, keeping the low bits")
+    (formal (mul i32 rs1 rs2))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 4000.0)
+    (power-estimate-mw 5.0)
+    (expected-speedup 1.0)
+    (rationale "Multiply, keeping the low bits"))
+
+  (definstruction MULH
+    (mnemonic MULH)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 1)
+    (func7 0x01)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "mulh $rd, $rs1, $rs2")
+    (semantics "High bits of a signed times signed product")
+    (formal (mulh i32 rs1 rs2))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 4000.0)
+    (power-estimate-mw 5.0)
+    (expected-speedup 1.0)
+    (rationale "High bits of a signed times signed product"))
+
+  (definstruction MULHSU
+    (mnemonic MULHSU)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 2)
+    (func7 0x01)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "mulhsu $rd, $rs1, $rs2")
+    (semantics "High bits of a signed times unsigned product")
+    (formal (mulhsu i32 rs1 rs2))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 4000.0)
+    (power-estimate-mw 5.0)
+    (expected-speedup 1.0)
+    (rationale "High bits of a signed times unsigned product"))
+
+  (definstruction MULHU
+    (mnemonic MULHU)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 3)
+    (func7 0x01)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "mulhu $rd, $rs1, $rs2")
+    (semantics "High bits of an unsigned times unsigned product")
+    (formal (mulhu i32 rs1 rs2))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 4000.0)
+    (power-estimate-mw 5.0)
+    (expected-speedup 1.0)
+    (rationale "High bits of an unsigned times unsigned product"))
+
+  (definstruction DIV
+    (mnemonic DIV)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 4)
+    (func7 0x01)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "div $rd, $rs1, $rs2")
+    (semantics "Signed division; by zero yields all ones, and the most negative divided by minus one overflows to itself")
+    (formal (select i32 (icmp_eq i32 rs2 0) 4294967295 (select i32 (and i32 (icmp_eq i32 rs1 2147483648) (icmp_eq i32 rs2 4294967295)) 2147483648 (sdiv i32 rs1 rs2))))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 4000.0)
+    (power-estimate-mw 5.0)
+    (expected-speedup 1.0)
+    (rationale "Signed division; by zero yields all ones, and the most negative divided by minus one overflows to itself"))
+
+  (definstruction DIVU
+    (mnemonic DIVU)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 5)
+    (func7 0x01)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "divu $rd, $rs1, $rs2")
+    (semantics "Unsigned division; by zero yields all ones")
+    (formal (select i32 (icmp_eq i32 rs2 0) 4294967295 (udiv i32 rs1 rs2)))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 4000.0)
+    (power-estimate-mw 5.0)
+    (expected-speedup 1.0)
+    (rationale "Unsigned division; by zero yields all ones"))
+
+  (definstruction REM
+    (mnemonic REM)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 6)
+    (func7 0x01)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "rem $rd, $rs1, $rs2")
+    (semantics "Signed remainder; by zero yields the dividend, and the overflow case yields zero")
+    (formal (select i32 (icmp_eq i32 rs2 0) rs1 (select i32 (and i32 (icmp_eq i32 rs1 2147483648) (icmp_eq i32 rs2 4294967295)) 0 (sub i32 rs1 (mul i32 (sdiv i32 rs1 rs2) rs2)))))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 4000.0)
+    (power-estimate-mw 5.0)
+    (expected-speedup 1.0)
+    (rationale "Signed remainder; by zero yields the dividend, and the overflow case yields zero"))
+
+  (definstruction REMU
+    (mnemonic REMU)
+    (isa rv32i)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 7)
+    (func7 0x01)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "remu $rd, $rs1, $rs2")
+    (semantics "Unsigned remainder; by zero yields the dividend")
+    (formal (select i32 (icmp_eq i32 rs2 0) rs1 (sub i32 rs1 (mul i32 (udiv i32 rs1 rs2) rs2))))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 4000.0)
+    (power-estimate-mw 5.0)
+    (expected-speedup 1.0)
+    (rationale "Unsigned remainder; by zero yields the dividend"))
+
+  ; --- A extension: atomic memory operations ----------------------------
+
+  (definstruction AMOSWAP_W
+    (mnemonic AMOSWAP_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 1) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoswap.w $rd, $rs2, ($rs1)")
+    (semantics "Atomically swap memory with rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 rs2 i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically swap memory with rs2"))
+
+  (definstruction AMOSWAP_W_AQ
+    (mnemonic AMOSWAP_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 1) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoswap.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Atomically swap memory with rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 rs2 i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically swap memory with rs2"))
+
+  (definstruction AMOSWAP_W_RL
+    (mnemonic AMOSWAP_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 1) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoswap.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Atomically swap memory with rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 rs2 i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically swap memory with rs2"))
+
+  (definstruction AMOSWAP_W_AQRL
+    (mnemonic AMOSWAP_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 1) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoswap.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Atomically swap memory with rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 rs2 i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically swap memory with rs2"))
+
+  (definstruction AMOADD_W
+    (mnemonic AMOADD_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 0) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoadd.w $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply add to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (add i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply add to memory and rs2"))
+
+  (definstruction AMOADD_W_AQ
+    (mnemonic AMOADD_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 0) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoadd.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply add to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (add i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply add to memory and rs2"))
+
+  (definstruction AMOADD_W_RL
+    (mnemonic AMOADD_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 0) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoadd.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply add to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (add i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply add to memory and rs2"))
+
+  (definstruction AMOADD_W_AQRL
+    (mnemonic AMOADD_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 0) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoadd.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply add to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (add i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply add to memory and rs2"))
+
+  (definstruction AMOXOR_W
+    (mnemonic AMOXOR_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 4) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoxor.w $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply xor to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (xor i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply xor to memory and rs2"))
+
+  (definstruction AMOXOR_W_AQ
+    (mnemonic AMOXOR_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 4) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoxor.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply xor to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (xor i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply xor to memory and rs2"))
+
+  (definstruction AMOXOR_W_RL
+    (mnemonic AMOXOR_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 4) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoxor.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply xor to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (xor i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply xor to memory and rs2"))
+
+  (definstruction AMOXOR_W_AQRL
+    (mnemonic AMOXOR_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 4) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoxor.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply xor to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (xor i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply xor to memory and rs2"))
+
+  (definstruction AMOAND_W
+    (mnemonic AMOAND_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 12) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoand.w $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply and to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (and i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply and to memory and rs2"))
+
+  (definstruction AMOAND_W_AQ
+    (mnemonic AMOAND_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 12) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoand.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply and to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (and i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply and to memory and rs2"))
+
+  (definstruction AMOAND_W_RL
+    (mnemonic AMOAND_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 12) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoand.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply and to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (and i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply and to memory and rs2"))
+
+  (definstruction AMOAND_W_AQRL
+    (mnemonic AMOAND_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 12) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoand.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply and to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (and i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply and to memory and rs2"))
+
+  (definstruction AMOOR_W
+    (mnemonic AMOOR_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 8) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoor.w $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply or to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (or i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply or to memory and rs2"))
+
+  (definstruction AMOOR_W_AQ
+    (mnemonic AMOOR_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 8) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoor.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply or to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (or i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply or to memory and rs2"))
+
+  (definstruction AMOOR_W_RL
+    (mnemonic AMOOR_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 8) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoor.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply or to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (or i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply or to memory and rs2"))
+
+  (definstruction AMOOR_W_AQRL
+    (mnemonic AMOOR_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 8) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amoor.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply or to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (or i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply or to memory and rs2"))
+
+  (definstruction AMOMIN_W
+    (mnemonic AMOMIN_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 16) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomin.w $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply min to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (min i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply min to memory and rs2"))
+
+  (definstruction AMOMIN_W_AQ
+    (mnemonic AMOMIN_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 16) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomin.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply min to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (min i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply min to memory and rs2"))
+
+  (definstruction AMOMIN_W_RL
+    (mnemonic AMOMIN_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 16) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomin.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply min to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (min i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply min to memory and rs2"))
+
+  (definstruction AMOMIN_W_AQRL
+    (mnemonic AMOMIN_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 16) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomin.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply min to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (min i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply min to memory and rs2"))
+
+  (definstruction AMOMAX_W
+    (mnemonic AMOMAX_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 20) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomax.w $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply max to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (max i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply max to memory and rs2"))
+
+  (definstruction AMOMAX_W_AQ
+    (mnemonic AMOMAX_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 20) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomax.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply max to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (max i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply max to memory and rs2"))
+
+  (definstruction AMOMAX_W_RL
+    (mnemonic AMOMAX_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 20) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomax.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply max to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (max i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply max to memory and rs2"))
+
+  (definstruction AMOMAX_W_AQRL
+    (mnemonic AMOMAX_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 20) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomax.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply max to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (max i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply max to memory and rs2"))
+
+  (definstruction AMOMINU_W
+    (mnemonic AMOMINU_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 24) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amominu.w $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply minu to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (minu i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply minu to memory and rs2"))
+
+  (definstruction AMOMINU_W_AQ
+    (mnemonic AMOMINU_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 24) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amominu.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply minu to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (minu i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply minu to memory and rs2"))
+
+  (definstruction AMOMINU_W_RL
+    (mnemonic AMOMINU_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 24) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amominu.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply minu to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (minu i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply minu to memory and rs2"))
+
+  (definstruction AMOMINU_W_AQRL
+    (mnemonic AMOMINU_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 24) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amominu.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply minu to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (minu i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply minu to memory and rs2"))
+
+  (definstruction AMOMAXU_W
+    (mnemonic AMOMAXU_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 28) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomaxu.w $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply maxu to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (maxu i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply maxu to memory and rs2"))
+
+  (definstruction AMOMAXU_W_AQ
+    (mnemonic AMOMAXU_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 28) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomaxu.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply maxu to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (maxu i32 rd rs2) i32 relaxed)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply maxu to memory and rs2"))
+
+  (definstruction AMOMAXU_W_RL
+    (mnemonic AMOMAXU_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 28) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomaxu.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply maxu to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed relaxed rs1))
+        (atomic_store rs1 (maxu i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply maxu to memory and rs2"))
+
+  (definstruction AMOMAXU_W_AQRL
+    (mnemonic AMOMAXU_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 28) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "amomaxu.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Atomically apply maxu to memory and rs2, returning the previous value")
+    (behavior
+      (atomic-group 1
+        (set rd (atomic_load i32 signed acquire rs1))
+        (atomic_store rs1 (maxu i32 rd rs2) i32 release)))
+    (latency 6)
+    (throughput 1.0)
+    (area-estimate-um2 3000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Atomically apply maxu to memory and rs2"))
+
+  ; --- A extension: load-reserved and store-conditional ------------------
+  ;
+  ; A known limitation, stated rather than hidden. RISC-V requires SC to *fail*
+  ; if another store to the reservation set intervenes between the LR and the
+  ; SC. This model clears the reservation only on SC, so an intervening store —
+  ; an AMO to the same address, say — leaves it valid and SC can report success
+  ; where the architecture requires failure. That is not conservative: a
+  ; permissive model here is wrong, not merely imprecise. Modelling it faithfully
+  ; means every store consulting the monitor, which is a larger change than this
+  ; corpus. The AArch64 seed's LDXR/STXR carry the same limitation.
+
+  (definstruction LR_W
+    (mnemonic LR_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 2) (aq 0) (rl 0) (rs2 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "lr.w $rd, ($rs1)")
+    (semantics "Load and register a reservation on the address; no ordering")
+    (behavior
+      (set rd (atomic_load i32 signed relaxed rs1))
+      (setstate exclusive_address rs1 i32)
+      (setstate exclusive_size 4 i8)
+      (setstate exclusive_valid 1 i1)
+      (setstate exclusive_value (load i32 unsigned rs1) i32))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 2000.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Load-reserved establishes the reservation store-conditional tests"))
+
+  (definstruction SC_W
+    (mnemonic SC_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 3) (aq 0) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "sc.w $rd, $rs2, ($rs1)")
+    (semantics "Store if the reservation still holds; rd reads zero on success; no ordering")
+    (behavior
+      (set rd (select i32 (or i32 (xor i32 exclusive_address rs1) (xor i32 exclusive_size 4) (xor i32 exclusive_valid 1)) 1 0))
+      (when (icmp_eq (or i32 (xor i32 exclusive_address rs1) (xor i32 exclusive_size 4) (xor i32 exclusive_valid 1)) 0)
+        (atomic_store rs1 rs2 i32 relaxed))
+      (setstate exclusive_valid 0 i1))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 2000.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Store-conditional reports success as zero, which is what makes a retry loop terminate"))
+
+  (definstruction LR_W_AQ
+    (mnemonic LR_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 2) (aq 1) (rl 0) (rs2 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "lr.w.aq $rd, ($rs1)")
+    (semantics "Load and register a reservation on the address; acquire")
+    (behavior
+      (set rd (atomic_load i32 signed acquire rs1))
+      (setstate exclusive_address rs1 i32)
+      (setstate exclusive_size 4 i8)
+      (setstate exclusive_valid 1 i1)
+      (setstate exclusive_value (load i32 unsigned rs1) i32))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 2000.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Load-reserved establishes the reservation store-conditional tests"))
+
+  (definstruction SC_W_AQ
+    (mnemonic SC_W_AQ)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 3) (aq 1) (rl 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "sc.w.aq $rd, $rs2, ($rs1)")
+    (semantics "Store if the reservation still holds; rd reads zero on success; acquire, which no store ordering can carry, so it is stated conservatively as a full fence after the store")
+    (behavior
+      (set rd (select i32 (or i32 (xor i32 exclusive_address rs1) (xor i32 exclusive_size 4) (xor i32 exclusive_valid 1)) 1 0))
+      (when (icmp_eq (or i32 (xor i32 exclusive_address rs1) (xor i32 exclusive_size 4) (xor i32 exclusive_valid 1)) 0)
+        (atomic_store rs1 rs2 i32 relaxed))
+      (barrier fence 51)
+      (setstate exclusive_valid 0 i1))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 2000.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Store-conditional reports success as zero, which is what makes a retry loop terminate"))
+
+  (definstruction LR_W_RL
+    (mnemonic LR_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 2) (aq 0) (rl 1) (rs2 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "lr.w.rl $rd, ($rs1)")
+    (semantics "Load and register a reservation on the address; release, which no load ordering can carry, so it is stated conservatively as a full fence before the load")
+    (behavior
+      (barrier fence 51)
+      (set rd (atomic_load i32 signed relaxed rs1))
+      (setstate exclusive_address rs1 i32)
+      (setstate exclusive_size 4 i8)
+      (setstate exclusive_valid 1 i1)
+      (setstate exclusive_value (load i32 unsigned rs1) i32))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 2000.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Load-reserved establishes the reservation store-conditional tests"))
+
+  (definstruction SC_W_RL
+    (mnemonic SC_W_RL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 3) (aq 0) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "sc.w.rl $rd, $rs2, ($rs1)")
+    (semantics "Store if the reservation still holds; rd reads zero on success; release")
+    (behavior
+      (set rd (select i32 (or i32 (xor i32 exclusive_address rs1) (xor i32 exclusive_size 4) (xor i32 exclusive_valid 1)) 1 0))
+      (when (icmp_eq (or i32 (xor i32 exclusive_address rs1) (xor i32 exclusive_size 4) (xor i32 exclusive_valid 1)) 0)
+        (atomic_store rs1 rs2 i32 release))
+      (setstate exclusive_valid 0 i1))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 2000.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Store-conditional reports success as zero, which is what makes a retry loop terminate"))
+
+  (definstruction LR_W_AQRL
+    (mnemonic LR_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 2) (aq 1) (rl 1) (rs2 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "lr.w.aqrl $rd, ($rs1)")
+    (semantics "Load and register a reservation on the address; acquire, with the release half stated conservatively as a full fence before it")
+    (behavior
+      (barrier fence 51)
+      (set rd (atomic_load i32 signed acquire rs1))
+      (setstate exclusive_address rs1 i32)
+      (setstate exclusive_size 4 i8)
+      (setstate exclusive_valid 1 i1)
+      (setstate exclusive_value (load i32 unsigned rs1) i32))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 2000.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Load-reserved establishes the reservation store-conditional tests"))
+
+  (definstruction SC_W_AQRL
+    (mnemonic SC_W_AQRL)
+    (isa rv32i)
+    (category custom)
+    (format RV_AMO)
+    (opcode 0x2f)
+    (func3 2)
+    (encoding (func5 3) (aq 1) (rl 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "sc.w.aqrl $rd, $rs2, ($rs1)")
+    (semantics "Store if the reservation still holds; rd reads zero on success; release, with the acquire half stated conservatively as a full fence after it")
+    (behavior
+      (set rd (select i32 (or i32 (xor i32 exclusive_address rs1) (xor i32 exclusive_size 4) (xor i32 exclusive_valid 1)) 1 0))
+      (when (icmp_eq (or i32 (xor i32 exclusive_address rs1) (xor i32 exclusive_size 4) (xor i32 exclusive_valid 1)) 0)
+        (atomic_store rs1 rs2 i32 release))
+      (barrier fence 51)
+      (setstate exclusive_valid 0 i1))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 2000.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Store-conditional reports success as zero, which is what makes a retry loop terminate"))
+
+  ; --- Invalid on a comparison ------------------------------------------
+  ;
+  ; RISC-V's two rules differ, and the difference is the whole content:
+  ; FLT and FLE signal invalid on *any* NaN, quiet or signalling, because an
+  ; ordering comparison has no answer for one. FEQ signals only on a
+  ; signalling NaN, because equality against a quiet NaN is defined -- it is
+  ; false.
+  ;
+  ; No new operator: which NaN a bit pattern is, is a predicate on the pattern,
+  ; the same fact FCLASS is built from. A quiet NaN sets the mantissa's top
+  ; bit; a signalling one leaves it clear.
+  (defsem rv_isnan32 ((x i32)) i32
+    (select i32 (icmp_eq i32 (and i32 (lshr i32 x 23) 0xff) 0xff)
+      (select i32 (icmp_eq i32 (and i32 x 0x7fffff) 0) 0 1)
+      0))
+
+  (defsem rv_isnan64 ((x i64)) i64
+    (select i64 (icmp_eq i64 (and i64 (lshr i64 x 52) 0x7ff) 0x7ff)
+      (select i64 (icmp_eq i64 (and i64 x 0xfffffffffffff) 0) 0 1)
+      0))
+
+  (defsem rv_issnan32 ((x i32)) i32
+    (select i32 (icmp_eq i32 (rv_isnan32 x) 1)
+      (select i32 (icmp_eq i32 (and i32 (lshr i32 x 22) 1) 1) 0 1)
+      0))
+
+  (defsem rv_issnan64 ((x i64)) i64
+    (select i64 (icmp_eq i64 (rv_isnan64 x) 1)
+      (select i64 (icmp_eq i64 (and i64 (lshr i64 x 51) 1) 1) 0 1)
+      0))
+
+  ; The ordering comparisons: any NaN.
+  (defsem rv_order_nv32 ((a i32) (b i32)) i5
+    (select i5 (icmp_eq i32 (or i32 (rv_isnan32 a) (rv_isnan32 b)) 1) 16 0))
+
+  (defsem rv_order_nv64 ((a i64) (b i64)) i5
+    (select i5 (icmp_eq i64 (or i64 (rv_isnan64 a) (rv_isnan64 b)) 1) 16 0))
+
+  ; Equality, and FMIN/FMAX: only a signalling NaN.
+  (defsem rv_quiet_nv32 ((a i32) (b i32)) i5
+    (select i5 (icmp_eq i32 (or i32 (rv_issnan32 a) (rv_issnan32 b)) 1) 16 0))
+
+  (defsem rv_quiet_nv64 ((a i64) (b i64)) i5
+    (select i5 (icmp_eq i64 (or i64 (rv_issnan64 a) (rv_issnan64 b)) 1) 16 0))
+
+  ; --- Floating-point classification ------------------------------------
+  ;
+  ; `FCLASS` writes a ten-bit mask with exactly one bit set, saying which of
+  ; RISC-V's ten classes the operand falls into. It needs no new operator: the
+  ; classification is a predicate on the bit pattern -- sign, an exponent field
+  ; that is all ones or all zeros, and a mantissa that is zero or not -- and an
+  ; f register read at an integer type is already those bits. Writing it out is
+  ; what lets every backend prove it, rather than each having to be taught a
+  ; primitive by hand.
+  ;
+  ;   bit 0 -inf   bit 2 -subnormal   bit 4 +0          bit 6 +normal   bit 8 sNaN
+  ;   bit 1 -normal  bit 3 -0         bit 5 +subnormal  bit 7 +inf      bit 9 qNaN
+  ;
+  ; Signalling and quiet NaN differ only in the mantissa's top bit, which is
+  ; set for quiet.
+  (defsem rv_fclass32 ((x i32)) i32
+    (let ((exp (and i32 (lshr i32 x 23) 0xff)))
+      (let ((mant (and i32 x 0x7fffff)))
+        (let ((neg (icmp_eq i32 (and i32 (lshr i32 x 31) 1) 1)))
+          (select i32 (icmp_eq i32 exp 0xff)
+            (select i32 (icmp_eq i32 mant 0)
+              (select i32 neg 0x001 0x080)
+              (select i32 (icmp_eq i32 (and i32 (lshr i32 mant 22) 1) 1) 0x200 0x100))
+            (select i32 (icmp_eq i32 exp 0)
+              (select i32 (icmp_eq i32 mant 0)
+                (select i32 neg 0x008 0x010)
+                (select i32 neg 0x004 0x020))
+              (select i32 neg 0x002 0x040)))))))
+
+  (defsem rv_fclass64 ((x i64)) i32
+    (let ((exp (and i64 (lshr i64 x 52) 0x7ff)))
+      (let ((mant (and i64 x 0xfffffffffffff)))
+        (let ((neg (icmp_eq i64 (and i64 (lshr i64 x 63) 1) 1)))
+          (select i32 (icmp_eq i64 exp 0x7ff)
+            (select i32 (icmp_eq i64 mant 0)
+              (select i32 neg 0x001 0x080)
+              (select i32 (icmp_eq i64 (and i64 (lshr i64 mant 51) 1) 1) 0x200 0x100))
+            (select i32 (icmp_eq i64 exp 0)
+              (select i32 (icmp_eq i64 mant 0)
+                (select i32 neg 0x008 0x010)
+                (select i32 neg 0x004 0x020))
+              (select i32 neg 0x002 0x040)))))))
+
+  ; --- F extension: single-precision floating point ---------------------
+  ;
+  ; The f registers are a second file: f0 is not x0, and FMV/FCVT move between
+  ; them. A register class carries an offset into the flat register array, so
+  ; f5 is slot 37 -- which is what lets one array model two files.
+  ;
+  ; What is still not described here, and why:
+  ;
+  ;   * **Zicsr** -- CSRRW/CSRRS/CSRRC and their immediate forms. This is the
+  ;     one that matters: `frm` is ISA state here and the DYN instructions read
+  ;     it, but nothing can *write* it, so a program cannot select a dynamic
+  ;     rounding mode. Describing DYN without Zicsr describes a machine whose
+  ;     mode register is read-only.
+  ;   * The RV64-only float/integer conversions: FCVT.L.S, FCVT.LU.S,
+  ;     FCVT.S.L, FCVT.S.LU and their D forms. The W forms are all here; these
+  ;     are the ones that need XLEN=64 to be worth having.
+  ;
+  ; FMIN/FMAX, FCLASS, the fused multiply-adds under a rounding mode, rm = 100
+  ; (RMM) and rm = 111 (DYN) were on this list and are now described. Two of
+  ; those entries had stated a reason that turned out to be wrong: DYN was said
+  ; to need "architectural state the description would have to read, not a
+  ; rounding mode it can name", when a behavior reads ISA state and a mode is
+  ; an ordinary argument to a `_rm` operator; and RMM was said to be
+  ; inexpressible because the operators carry AArch64's two-bit mode, when the
+  ; mode simply had to become three bits.
+
+  (definstruction FLS
+    (mnemonic FLS)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x07)
+    (encoding (func3 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "fls $rd, $imm($rs1)")
+    (semantics "Load a 32-bit float")
+    (behavior
+      (set rd (load i32 unsigned (add i32 rs1 (sext i32 12 imm))))
+      (set rd (or i64 rd (not i64 (ones i64 32)))))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 32-bit float"))
+
+  (definstruction FSS
+    (mnemonic FSS)
+    (isa rv32i)
+    (category custom)
+    (format S)
+    (opcode 0x27)
+    (encoding (func3 2))
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_fpr i64 in)
+      (imm imm i32 in))
+    (asm "fss $rs2, $imm($rs1)")
+    (semantics "Store a 32-bit float")
+    (behavior
+      (store (add i32 rs1 (sext i32 12 imm)) rs2 i32))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Store a 32-bit float"))
+
+  (definstruction FADD_S_RNE
+    (mnemonic FADD_S_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 0) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.s $rd, $rs1, $rs2, rne")
+    (semantics "fadd under RNE rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fadd f32 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fadd_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RNE rounding"))
+
+  (definstruction FADD_S_RTZ
+    (mnemonic FADD_S_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 0) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.s $rd, $rs1, $rs2, rtz")
+    (semantics "fadd under RTZ rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fadd_rm f32 3 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fadd_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RTZ rounding"))
+
+  (definstruction FADD_S_RDN
+    (mnemonic FADD_S_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 0) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.s $rd, $rs1, $rs2, rdn")
+    (semantics "fadd under RDN rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fadd_rm f32 2 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fadd_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RDN rounding"))
+
+  (definstruction FADD_S_RUP
+    (mnemonic FADD_S_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 0) (rm 3))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.s $rd, $rs1, $rs2, rup")
+    (semantics "fadd under RUP rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fadd_rm f32 1 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fadd_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RUP rounding"))
+
+  (definstruction FSUB_S_RNE
+    (mnemonic FSUB_S_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 4) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.s $rd, $rs1, $rs2, rne")
+    (semantics "fsub under RNE rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsub f32 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsub_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RNE rounding"))
+
+  (definstruction FSUB_S_RTZ
+    (mnemonic FSUB_S_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 4) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.s $rd, $rs1, $rs2, rtz")
+    (semantics "fsub under RTZ rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsub_rm f32 3 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsub_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RTZ rounding"))
+
+  (definstruction FSUB_S_RDN
+    (mnemonic FSUB_S_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 4) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.s $rd, $rs1, $rs2, rdn")
+    (semantics "fsub under RDN rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsub_rm f32 2 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsub_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RDN rounding"))
+
+  (definstruction FSUB_S_RUP
+    (mnemonic FSUB_S_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 4) (rm 3))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.s $rd, $rs1, $rs2, rup")
+    (semantics "fsub under RUP rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsub_rm f32 1 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsub_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RUP rounding"))
+
+  (definstruction FMUL_S_RNE
+    (mnemonic FMUL_S_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 8) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.s $rd, $rs1, $rs2, rne")
+    (semantics "fmul under RNE rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fmul f32 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fmul_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RNE rounding"))
+
+  (definstruction FMUL_S_RTZ
+    (mnemonic FMUL_S_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 8) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.s $rd, $rs1, $rs2, rtz")
+    (semantics "fmul under RTZ rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fmul_rm f32 3 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fmul_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RTZ rounding"))
+
+  (definstruction FMUL_S_RDN
+    (mnemonic FMUL_S_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 8) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.s $rd, $rs1, $rs2, rdn")
+    (semantics "fmul under RDN rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fmul_rm f32 2 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fmul_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RDN rounding"))
+
+  (definstruction FMUL_S_RUP
+    (mnemonic FMUL_S_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 8) (rm 3))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.s $rd, $rs1, $rs2, rup")
+    (semantics "fmul under RUP rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fmul_rm f32 1 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fmul_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RUP rounding"))
+
+  (definstruction FDIV_S_RNE
+    (mnemonic FDIV_S_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 12) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.s $rd, $rs1, $rs2, rne")
+    (semantics "fdiv under RNE rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fdiv f32 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fdiv_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RNE rounding"))
+
+  (definstruction FDIV_S_RTZ
+    (mnemonic FDIV_S_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 12) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.s $rd, $rs1, $rs2, rtz")
+    (semantics "fdiv under RTZ rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fdiv_rm f32 3 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fdiv_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RTZ rounding"))
+
+  (definstruction FDIV_S_RDN
+    (mnemonic FDIV_S_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 12) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.s $rd, $rs1, $rs2, rdn")
+    (semantics "fdiv under RDN rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fdiv_rm f32 2 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fdiv_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RDN rounding"))
+
+  (definstruction FDIV_S_RUP
+    (mnemonic FDIV_S_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 12) (rm 3))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.s $rd, $rs1, $rs2, rup")
+    (semantics "fdiv under RUP rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fdiv_rm f32 1 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fdiv_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RUP rounding"))
+
+  (definstruction FSQRT_S_RNE
+    (mnemonic FSQRT_S_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 44) (rm 0) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.s $rd, $rs1, rne")
+    (semantics "Square root under RNE rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsqrt f32 rs1)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsqrt_fx f32 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RNE rounding"))
+
+  (definstruction FSQRT_S_RTZ
+    (mnemonic FSQRT_S_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 44) (rm 1) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.s $rd, $rs1, rtz")
+    (semantics "Square root under RTZ rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsqrt_rm f32 3 rs1)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsqrt_fx f32 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RTZ rounding"))
+
+  (definstruction FSQRT_S_RDN
+    (mnemonic FSQRT_S_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 44) (rm 2) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.s $rd, $rs1, rdn")
+    (semantics "Square root under RDN rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsqrt_rm f32 2 rs1)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsqrt_fx f32 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RDN rounding"))
+
+  (definstruction FSQRT_S_RUP
+    (mnemonic FSQRT_S_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 44) (rm 3) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.s $rd, $rs1, rup")
+    (semantics "Square root under RUP rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsqrt_rm f32 1 rs1)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsqrt_fx f32 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RUP rounding"))
+
+  (definstruction FENCE
+    (mnemonic FENCE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FENCE)
+    (opcode 0x0f)
+    (func3 0)
+    (encoding (fm 0) (rd 0) (rs1 0))
+    (operands
+      (option imm i8 in))
+    (asm "fence $option")
+    (semantics "Order the memory accesses named by the predecessor and successor sets")
+    (behavior (barrier fence option))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32I/RV64I memory fence"))
+
+  ; `fence.i` is the Zifencei extension, and it is not a memory fence: it
+  ; orders instruction *fetch* against prior writes to instruction memory,
+  ; which is the pipeline rather than the memory model -- the same distinction
+  ; AArch64 draws between `dmb` and `isb`. Its immediate field is reserved and
+  ; zero, so unlike `FENCE` it has no option to name.
+  (definstruction FENCE_I
+    (mnemonic FENCE_I)
+    (isa rv32i)
+    (category custom)
+    (format RV_FENCE)
+    (opcode 0x0f)
+    (func3 1)
+    (encoding (fm 0) (option 0) (rd 0) (rs1 0))
+    (operands)
+    (asm "fence.i")
+    (semantics "Order instruction fetch against prior writes to instruction memory")
+    (behavior (barrier fence_i))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zifencei instruction-fetch fence"))
+
+  (definstruction ECALL
+    (mnemonic ECALL)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x73)
+    (func3 0)
+    (encoding (rd 0) (rs1 0) (imm 0))
+    (operands)
+    (asm "ecall")
+    (semantics "Request a service of the execution environment")
+    (behavior
+      (trap ecall))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32I ecall"))
+
+  (definstruction EBREAK
+    (mnemonic EBREAK)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x73)
+    (func3 0)
+    (encoding (rd 0) (rs1 0) (imm 1))
+    (operands)
+    (asm "ebreak")
+    (semantics "Return control to a debugger")
+    (behavior
+      (trap ebreak))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32I ebreak"))
+
+  (definstruction FMIN_S
+    (mnemonic FMIN_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 20) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmin.s $rd, $rs1, $rs2")
+    (semantics "The smaller of two, selected and not computed")
+    (behavior
+      (set rd (or i64 (zext i64 32 (select i32 (fcmp_olt i32 rs1 rs2) rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (rv_quiet_nv32 (and i32 rs1 0xffffffff) (and i32 rs2 0xffffffff))) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S smaller of two"))
+
+  (definstruction FMAX_S
+    (mnemonic FMAX_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 20) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmax.s $rd, $rs1, $rs2")
+    (semantics "The larger of two, selected and not computed")
+    (behavior
+      (set rd (or i64 (zext i64 32 (select i32 (fcmp_olt i32 rs1 rs2) rs2 rs1)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (rv_quiet_nv32 (and i32 rs1 0xffffffff) (and i32 rs2 0xffffffff))) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S larger of two"))
+
+  (definstruction FMIN_D
+    (mnemonic FMIN_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 21) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmin.d $rd, $rs1, $rs2")
+    (semantics "The smaller of two, selected and not computed")
+    (behavior
+      (set rd (select i64 (fcmp_olt i64 rs1 rs2) rs1 rs2))
+      (setstate fflags (or i5 fflags (rv_quiet_nv64 rs1 rs2)) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D smaller of two"))
+
+  (definstruction FMAX_D
+    (mnemonic FMAX_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 21) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmax.d $rd, $rs1, $rs2")
+    (semantics "The larger of two, selected and not computed")
+    (behavior
+      (set rd (select i64 (fcmp_olt i64 rs1 rs2) rs2 rs1))
+      (setstate fflags (or i5 fflags (rv_quiet_nv64 rs1 rs2)) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D larger of two"))
+
+  (definstruction FMADD_S_RNE
+    (mnemonic FMADD_S_RNE)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 0)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.s $rd, $rs1, $rs2, $rs3, rne")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RNE")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma f32 rs1 rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RNE"))
+
+  (definstruction FMADD_D_RNE
+    (mnemonic FMADD_D_RNE)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 0)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.d $rd, $rs1, $rs2, $rs3, rne")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RNE")
+    (behavior
+      (set rd (fma f64 rs1 rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RNE"))
+
+  (definstruction FMADD_S_RTZ
+    (mnemonic FMADD_S_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 1)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.s $rd, $rs1, $rs2, $rs3, rtz")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RTZ")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 3 rs1 rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FMADD_D_RTZ
+    (mnemonic FMADD_D_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 1)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.d $rd, $rs1, $rs2, $rs3, rtz")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RTZ")
+    (behavior
+      (set rd (fma_rm f64 3 rs1 rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FMADD_S_RDN
+    (mnemonic FMADD_S_RDN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 2)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.s $rd, $rs1, $rs2, $rs3, rdn")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RDN")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 2 rs1 rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RDN"))
+
+  (definstruction FMADD_D_RDN
+    (mnemonic FMADD_D_RDN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 2)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.d $rd, $rs1, $rs2, $rs3, rdn")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RDN")
+    (behavior
+      (set rd (fma_rm f64 2 rs1 rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RDN"))
+
+  (definstruction FMADD_S_RUP
+    (mnemonic FMADD_S_RUP)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 3)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.s $rd, $rs1, $rs2, $rs3, rup")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RUP")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 1 rs1 rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RUP"))
+
+  (definstruction FMADD_D_RUP
+    (mnemonic FMADD_D_RUP)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 3)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.d $rd, $rs1, $rs2, $rs3, rup")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RUP")
+    (behavior
+      (set rd (fma_rm f64 1 rs1 rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RUP"))
+
+  (definstruction FMSUB_S_RNE
+    (mnemonic FMSUB_S_RNE)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 0)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.s $rd, $rs1, $rs2, $rs3, rne")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RNE")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma f32 rs1 rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RNE"))
+
+  (definstruction FMSUB_D_RNE
+    (mnemonic FMSUB_D_RNE)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 0)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.d $rd, $rs1, $rs2, $rs3, rne")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RNE")
+    (behavior
+      (set rd (fma f64 rs1 rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RNE"))
+
+  (definstruction FMSUB_S_RTZ
+    (mnemonic FMSUB_S_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 1)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.s $rd, $rs1, $rs2, $rs3, rtz")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RTZ")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 3 rs1 rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FMSUB_D_RTZ
+    (mnemonic FMSUB_D_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 1)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.d $rd, $rs1, $rs2, $rs3, rtz")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RTZ")
+    (behavior
+      (set rd (fma_rm f64 3 rs1 rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FMSUB_S_RDN
+    (mnemonic FMSUB_S_RDN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 2)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.s $rd, $rs1, $rs2, $rs3, rdn")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RDN")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 2 rs1 rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RDN"))
+
+  (definstruction FMSUB_D_RDN
+    (mnemonic FMSUB_D_RDN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 2)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.d $rd, $rs1, $rs2, $rs3, rdn")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RDN")
+    (behavior
+      (set rd (fma_rm f64 2 rs1 rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RDN"))
+
+  (definstruction FMSUB_S_RUP
+    (mnemonic FMSUB_S_RUP)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 3)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.s $rd, $rs1, $rs2, $rs3, rup")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RUP")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 1 rs1 rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RUP"))
+
+  (definstruction FMSUB_D_RUP
+    (mnemonic FMSUB_D_RUP)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 3)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.d $rd, $rs1, $rs2, $rs3, rup")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RUP")
+    (behavior
+      (set rd (fma_rm f64 1 rs1 rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RUP"))
+
+  (definstruction FNMSUB_S_RNE
+    (mnemonic FNMSUB_S_RNE)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 0)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.s $rd, $rs1, $rs2, $rs3, rne")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RNE")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma f32 (fneg f32 rs1) rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RNE"))
+
+  (definstruction FNMSUB_D_RNE
+    (mnemonic FNMSUB_D_RNE)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 0)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.d $rd, $rs1, $rs2, $rs3, rne")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RNE")
+    (behavior
+      (set rd (fma f64 (fneg f64 rs1) rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RNE"))
+
+  (definstruction FNMSUB_S_RTZ
+    (mnemonic FNMSUB_S_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 1)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.s $rd, $rs1, $rs2, $rs3, rtz")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RTZ")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 3 (fneg f32 rs1) rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FNMSUB_D_RTZ
+    (mnemonic FNMSUB_D_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 1)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.d $rd, $rs1, $rs2, $rs3, rtz")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RTZ")
+    (behavior
+      (set rd (fma_rm f64 3 (fneg f64 rs1) rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FNMSUB_S_RDN
+    (mnemonic FNMSUB_S_RDN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 2)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.s $rd, $rs1, $rs2, $rs3, rdn")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RDN")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 2 (fneg f32 rs1) rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RDN"))
+
+  (definstruction FNMSUB_D_RDN
+    (mnemonic FNMSUB_D_RDN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 2)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.d $rd, $rs1, $rs2, $rs3, rdn")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RDN")
+    (behavior
+      (set rd (fma_rm f64 2 (fneg f64 rs1) rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RDN"))
+
+  (definstruction FNMSUB_S_RUP
+    (mnemonic FNMSUB_S_RUP)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 3)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.s $rd, $rs1, $rs2, $rs3, rup")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RUP")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 1 (fneg f32 rs1) rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RUP"))
+
+  (definstruction FNMSUB_D_RUP
+    (mnemonic FNMSUB_D_RUP)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 3)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.d $rd, $rs1, $rs2, $rs3, rup")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RUP")
+    (behavior
+      (set rd (fma_rm f64 1 (fneg f64 rs1) rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RUP"))
+
+  (definstruction FNMADD_S_RNE
+    (mnemonic FNMADD_S_RNE)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 0)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.s $rd, $rs1, $rs2, $rs3, rne")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RNE")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma f32 (fneg f32 rs1) rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RNE"))
+
+  (definstruction FNMADD_D_RNE
+    (mnemonic FNMADD_D_RNE)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 0)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.d $rd, $rs1, $rs2, $rs3, rne")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RNE")
+    (behavior
+      (set rd (fma f64 (fneg f64 rs1) rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RNE"))
+
+  (definstruction FNMADD_S_RTZ
+    (mnemonic FNMADD_S_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 1)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.s $rd, $rs1, $rs2, $rs3, rtz")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RTZ")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 3 (fneg f32 rs1) rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FNMADD_D_RTZ
+    (mnemonic FNMADD_D_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 1)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.d $rd, $rs1, $rs2, $rs3, rtz")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RTZ")
+    (behavior
+      (set rd (fma_rm f64 3 (fneg f64 rs1) rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FNMADD_S_RDN
+    (mnemonic FNMADD_S_RDN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 2)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.s $rd, $rs1, $rs2, $rs3, rdn")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RDN")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 2 (fneg f32 rs1) rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RDN"))
+
+  (definstruction FNMADD_D_RDN
+    (mnemonic FNMADD_D_RDN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 2)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.d $rd, $rs1, $rs2, $rs3, rdn")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RDN")
+    (behavior
+      (set rd (fma_rm f64 2 (fneg f64 rs1) rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RDN"))
+
+  (definstruction FNMADD_S_RUP
+    (mnemonic FNMADD_S_RUP)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 3)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.s $rd, $rs1, $rs2, $rs3, rup")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RUP")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 1 (fneg f32 rs1) rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RUP"))
+
+  (definstruction FNMADD_D_RUP
+    (mnemonic FNMADD_D_RUP)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 3)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.d $rd, $rs1, $rs2, $rs3, rup")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RUP")
+    (behavior
+      (set rd (fma_rm f64 1 (fneg f64 rs1) rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RUP"))
+
+  (definstruction FMV_X_W
+    (mnemonic FMV_X_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 112) (rm 0) (rs2 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fmv.x.w $rd, $rs1")
+    (semantics "The single's bits into an integer register")
+    ; XLEN is 32 here, so the low half of the f register *is* the result --
+    ; RV64's `FMV.X.W` sign-extends it into a 64-bit x register instead.
+    (formal (and i32 rs1 0xffffffff))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32F move to integer"))
+
+  (definstruction FCLASS_S
+    (mnemonic FCLASS_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 112) (rm 1) (rs2 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fclass.s $rd, $rs1")
+    (semantics "Which of the ten classes the single falls into")
+    (formal (rv_fclass32 (and i32 rs1 0xffffffff)))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32F classify"))
+
+  (definstruction FCLASS_D
+    (mnemonic FCLASS_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 113) (rm 1) (rs2 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fclass.d $rd, $rs1")
+    (semantics "Which of the ten classes the double falls into")
+    (formal (rv_fclass64 rs1))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D classify"))
+
+  (definstruction FMV_W_X
+    (mnemonic FMV_W_X)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 120) (rm 0) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_gpr i32 in))
+    (asm "fmv.w.x $rd, $rs1")
+    (semantics "The integer's bits into a single")
+    (formal (or i64 (zext i64 32 rs1) 0xffffffff00000000))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "RV32F move from integer"))
+
+  (definstruction FSGNJ_S
+    (mnemonic FSGNJ_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 16) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsgnj.s $rd, $rs1, $rs2")
+    (semantics "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode")
+    (formal (or i64 (zext i64 32 (or i32 (and i32 rs1 0x7fffffff) (and i32 rs2 0x80000000))) 0xffffffff00000000))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode"))
+
+  (definstruction FSGNJN_S
+    (mnemonic FSGNJN_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 16) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsgnjn.s $rd, $rs1, $rs2")
+    (semantics "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode")
+    (formal (or i64 (zext i64 32 (or i32 (and i32 rs1 0x7fffffff) (and i32 (xor i32 rs2 0x80000000) 0x80000000))) 0xffffffff00000000))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode"))
+
+  (definstruction FSGNJX_S
+    (mnemonic FSGNJX_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 16) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsgnjx.s $rd, $rs1, $rs2")
+    (semantics "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode")
+    (formal (or i64 (zext i64 32 (or i32 (and i32 rs1 0x7fffffff) (and i32 (xor i32 rs1 rs2) 0x80000000))) 0xffffffff00000000))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode"))
+
+  (definstruction FLE_S
+    (mnemonic FLE_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 80) (rm 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fle.s $rd, $rs1, $rs2")
+    (semantics "Ordered comparison writing 0 or 1 to an integer register")
+    (behavior
+      (set rd (fcmp_ole f32 rs1 rs2))
+      (setstate fflags (or i5 fflags (rv_order_nv32 (and i32 rs1 0xffffffff) (and i32 rs2 0xffffffff))) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Ordered comparison writing 0 or 1 to an integer register"))
+
+  (definstruction FLT_S
+    (mnemonic FLT_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 80) (rm 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "flt.s $rd, $rs1, $rs2")
+    (semantics "Ordered comparison writing 0 or 1 to an integer register")
+    (behavior
+      (set rd (fcmp_olt f32 rs1 rs2))
+      (setstate fflags (or i5 fflags (rv_order_nv32 (and i32 rs1 0xffffffff) (and i32 rs2 0xffffffff))) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Ordered comparison writing 0 or 1 to an integer register"))
+
+  (definstruction FEQ_S
+    (mnemonic FEQ_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 80) (rm 2))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "feq.s $rd, $rs1, $rs2")
+    (semantics "Ordered comparison writing 0 or 1 to an integer register")
+    (behavior
+      (set rd (fcmp_oeq f32 rs1 rs2))
+      (setstate fflags (or i5 fflags (rv_quiet_nv32 (and i32 rs1 0xffffffff) (and i32 rs2 0xffffffff))) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Ordered comparison writing 0 or 1 to an integer register"))
+
+  (definstruction FCVT_W_S
+    (mnemonic FCVT_W_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 96) (rm 1) (rs2 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fcvt.w.s $rd, $rs1")
+    (semantics "Convert to a signed 32-bit integer, toward zero and saturating")
+    (behavior
+      (set rd (sext i32 32 (fcvt_f2s i32 32 rs1)))
+      (setstate fflags (or i5 fflags (fcvt_f2s_fx i32 32 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert to a signed 32-bit integer, toward zero and saturating"))
+
+  (definstruction FCVT_WU_S
+    (mnemonic FCVT_WU_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 96) (rm 1) (rs2 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fcvt.wu.s $rd, $rs1")
+    (semantics "Convert to an unsigned 32-bit integer, toward zero and saturating")
+    (behavior
+      (set rd (sext i32 32 (fcvt_f2u i32 32 rs1)))
+      (setstate fflags (or i5 fflags (fcvt_f2u_fx i32 32 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert to an unsigned 32-bit integer, toward zero and saturating"))
+
+  (definstruction FCVT_S_W
+    (mnemonic FCVT_S_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 104) (rm 0) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_gpr i32 in))
+    (asm "fcvt.s.w $rd, $rs1")
+    (semantics "Convert a signed 32-bit integer to a float")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fcvt_s2f f32 32 rs1)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fcvt_s2f_fx f32 32 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert a signed 32-bit integer to a float"))
+
+  (definstruction FCVT_S_WU
+    (mnemonic FCVT_S_WU)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 104) (rm 0) (rs2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_gpr i32 in))
+    (asm "fcvt.s.wu $rd, $rs1")
+    (semantics "Convert an unsigned 32-bit integer to a float")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fcvt_u2f f32 32 rs1)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fcvt_u2f_fx f32 32 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert an unsigned 32-bit integer to a float"))
+
+  ; --- D extension: double-precision floating point ---------------------
+  ;
+  ; The same shapes as F with func7 raised by one, plus the conversions between
+  ; the two precisions. FLEN is set by which extensions are present rather than
+  ; by XLEN, so with `D` the f registers are 64 bits on RV32 exactly as on RV64
+  ; -- which the register class states, and which is why a single is NaN-boxed
+  ; into the high bits rather than stored narrow.
+
+  (definstruction FLD
+    (mnemonic FLD)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x07)
+    (encoding (func3 3))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "fld $rd, $imm($rs1)")
+    (semantics "Load a 64-bit float")
+    (behavior
+      (set rd (load i64 unsigned (add i64 rs1 (sext i64 12 imm)))))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 64-bit float"))
+
+  (definstruction FSD
+    (mnemonic FSD)
+    (isa rv32i)
+    (category custom)
+    (format S)
+    (opcode 0x27)
+    (encoding (func3 3))
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_fpr i64 in)
+      (imm imm i32 in))
+    (asm "fsd $rs2, $imm($rs1)")
+    (semantics "Store a 64-bit float")
+    (behavior
+      (store (add i64 rs1 (sext i64 12 imm)) rs2 i64))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Store a 64-bit float"))
+
+  (definstruction FADD_D_RNE
+    (mnemonic FADD_D_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 1) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.d $rd, $rs1, $rs2, rne")
+    (semantics "fadd under RNE rounding")
+    (behavior
+      (set rd (fadd f64 rs1 rs2))
+      (setstate fflags (or i5 fflags (fadd_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RNE rounding"))
+
+  (definstruction FADD_D_RTZ
+    (mnemonic FADD_D_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 1) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.d $rd, $rs1, $rs2, rtz")
+    (semantics "fadd under RTZ rounding")
+    (behavior
+      (set rd (fadd_rm f64 3 rs1 rs2))
+      (setstate fflags (or i5 fflags (fadd_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RTZ rounding"))
+
+  (definstruction FADD_D_RDN
+    (mnemonic FADD_D_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 1) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.d $rd, $rs1, $rs2, rdn")
+    (semantics "fadd under RDN rounding")
+    (behavior
+      (set rd (fadd_rm f64 2 rs1 rs2))
+      (setstate fflags (or i5 fflags (fadd_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RDN rounding"))
+
+  (definstruction FADD_D_RUP
+    (mnemonic FADD_D_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 1) (rm 3))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.d $rd, $rs1, $rs2, rup")
+    (semantics "fadd under RUP rounding")
+    (behavior
+      (set rd (fadd_rm f64 1 rs1 rs2))
+      (setstate fflags (or i5 fflags (fadd_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RUP rounding"))
+
+  (definstruction FSUB_D_RNE
+    (mnemonic FSUB_D_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 5) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.d $rd, $rs1, $rs2, rne")
+    (semantics "fsub under RNE rounding")
+    (behavior
+      (set rd (fsub f64 rs1 rs2))
+      (setstate fflags (or i5 fflags (fsub_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RNE rounding"))
+
+  (definstruction FSUB_D_RTZ
+    (mnemonic FSUB_D_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 5) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.d $rd, $rs1, $rs2, rtz")
+    (semantics "fsub under RTZ rounding")
+    (behavior
+      (set rd (fsub_rm f64 3 rs1 rs2))
+      (setstate fflags (or i5 fflags (fsub_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RTZ rounding"))
+
+  (definstruction FSUB_D_RDN
+    (mnemonic FSUB_D_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 5) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.d $rd, $rs1, $rs2, rdn")
+    (semantics "fsub under RDN rounding")
+    (behavior
+      (set rd (fsub_rm f64 2 rs1 rs2))
+      (setstate fflags (or i5 fflags (fsub_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RDN rounding"))
+
+  (definstruction FSUB_D_RUP
+    (mnemonic FSUB_D_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 5) (rm 3))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.d $rd, $rs1, $rs2, rup")
+    (semantics "fsub under RUP rounding")
+    (behavior
+      (set rd (fsub_rm f64 1 rs1 rs2))
+      (setstate fflags (or i5 fflags (fsub_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RUP rounding"))
+
+  (definstruction FMUL_D_RNE
+    (mnemonic FMUL_D_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 9) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.d $rd, $rs1, $rs2, rne")
+    (semantics "fmul under RNE rounding")
+    (behavior
+      (set rd (fmul f64 rs1 rs2))
+      (setstate fflags (or i5 fflags (fmul_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RNE rounding"))
+
+  (definstruction FMUL_D_RTZ
+    (mnemonic FMUL_D_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 9) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.d $rd, $rs1, $rs2, rtz")
+    (semantics "fmul under RTZ rounding")
+    (behavior
+      (set rd (fmul_rm f64 3 rs1 rs2))
+      (setstate fflags (or i5 fflags (fmul_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RTZ rounding"))
+
+  (definstruction FMUL_D_RDN
+    (mnemonic FMUL_D_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 9) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.d $rd, $rs1, $rs2, rdn")
+    (semantics "fmul under RDN rounding")
+    (behavior
+      (set rd (fmul_rm f64 2 rs1 rs2))
+      (setstate fflags (or i5 fflags (fmul_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RDN rounding"))
+
+  (definstruction FMUL_D_RUP
+    (mnemonic FMUL_D_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 9) (rm 3))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.d $rd, $rs1, $rs2, rup")
+    (semantics "fmul under RUP rounding")
+    (behavior
+      (set rd (fmul_rm f64 1 rs1 rs2))
+      (setstate fflags (or i5 fflags (fmul_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RUP rounding"))
+
+  (definstruction FDIV_D_RNE
+    (mnemonic FDIV_D_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 13) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.d $rd, $rs1, $rs2, rne")
+    (semantics "fdiv under RNE rounding")
+    (behavior
+      (set rd (fdiv f64 rs1 rs2))
+      (setstate fflags (or i5 fflags (fdiv_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RNE rounding"))
+
+  (definstruction FDIV_D_RTZ
+    (mnemonic FDIV_D_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 13) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.d $rd, $rs1, $rs2, rtz")
+    (semantics "fdiv under RTZ rounding")
+    (behavior
+      (set rd (fdiv_rm f64 3 rs1 rs2))
+      (setstate fflags (or i5 fflags (fdiv_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RTZ rounding"))
+
+  (definstruction FDIV_D_RDN
+    (mnemonic FDIV_D_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 13) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.d $rd, $rs1, $rs2, rdn")
+    (semantics "fdiv under RDN rounding")
+    (behavior
+      (set rd (fdiv_rm f64 2 rs1 rs2))
+      (setstate fflags (or i5 fflags (fdiv_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RDN rounding"))
+
+  (definstruction FDIV_D_RUP
+    (mnemonic FDIV_D_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 13) (rm 3))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.d $rd, $rs1, $rs2, rup")
+    (semantics "fdiv under RUP rounding")
+    (behavior
+      (set rd (fdiv_rm f64 1 rs1 rs2))
+      (setstate fflags (or i5 fflags (fdiv_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RUP rounding"))
+
+  (definstruction FSQRT_D_RNE
+    (mnemonic FSQRT_D_RNE)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 45) (rm 0) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.d $rd, $rs1, rne")
+    (semantics "Square root under RNE rounding")
+    (behavior
+      (set rd (fsqrt f64 rs1))
+      (setstate fflags (or i5 fflags (fsqrt_fx f64 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RNE rounding"))
+
+  (definstruction FSQRT_D_RTZ
+    (mnemonic FSQRT_D_RTZ)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 45) (rm 1) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.d $rd, $rs1, rtz")
+    (semantics "Square root under RTZ rounding")
+    (behavior
+      (set rd (fsqrt_rm f64 3 rs1))
+      (setstate fflags (or i5 fflags (fsqrt_fx f64 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RTZ rounding"))
+
+  (definstruction FSQRT_D_RDN
+    (mnemonic FSQRT_D_RDN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 45) (rm 2) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.d $rd, $rs1, rdn")
+    (semantics "Square root under RDN rounding")
+    (behavior
+      (set rd (fsqrt_rm f64 2 rs1))
+      (setstate fflags (or i5 fflags (fsqrt_fx f64 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RDN rounding"))
+
+  (definstruction FSQRT_D_RUP
+    (mnemonic FSQRT_D_RUP)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 45) (rm 3) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.d $rd, $rs1, rup")
+    (semantics "Square root under RUP rounding")
+    (behavior
+      (set rd (fsqrt_rm f64 1 rs1))
+      (setstate fflags (or i5 fflags (fsqrt_fx f64 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RUP rounding"))
+
+  (definstruction FSGNJ_D
+    (mnemonic FSGNJ_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 17) (rm 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsgnj.d $rd, $rs1, $rs2")
+    (semantics "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode")
+    (formal (or i64 (and i64 rs1 0x7fffffffffffffff) (and i64 rs2 0x8000000000000000)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode"))
+
+  (definstruction FSGNJN_D
+    (mnemonic FSGNJN_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 17) (rm 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsgnjn.d $rd, $rs1, $rs2")
+    (semantics "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode")
+    (formal (or i64 (and i64 rs1 0x7fffffffffffffff) (and i64 (xor i64 rs2 0x8000000000000000) 0x8000000000000000)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode"))
+
+  (definstruction FSGNJX_D
+    (mnemonic FSGNJX_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 17) (rm 2))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsgnjx.d $rd, $rs1, $rs2")
+    (semantics "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode")
+    (formal (or i64 (and i64 rs1 0x7fffffffffffffff) (and i64 (xor i64 rs1 rs2) 0x8000000000000000)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Magnitude from rs1, sign from rs2; pure bit manipulation, so no rounding mode"))
+
+  (definstruction FLE_D
+    (mnemonic FLE_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 81) (rm 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fle.d $rd, $rs1, $rs2")
+    (semantics "Ordered comparison writing 0 or 1 to an integer register")
+    (behavior
+      (set rd (fcmp_ole f64 rs1 rs2))
+      (setstate fflags (or i5 fflags (rv_order_nv64 rs1 rs2)) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Ordered comparison writing 0 or 1 to an integer register"))
+
+  (definstruction FLT_D
+    (mnemonic FLT_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 81) (rm 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "flt.d $rd, $rs1, $rs2")
+    (semantics "Ordered comparison writing 0 or 1 to an integer register")
+    (behavior
+      (set rd (fcmp_olt f64 rs1 rs2))
+      (setstate fflags (or i5 fflags (rv_order_nv64 rs1 rs2)) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Ordered comparison writing 0 or 1 to an integer register"))
+
+  (definstruction FEQ_D
+    (mnemonic FEQ_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 81) (rm 2))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "feq.d $rd, $rs1, $rs2")
+    (semantics "Ordered comparison writing 0 or 1 to an integer register")
+    (behavior
+      (set rd (fcmp_oeq f64 rs1 rs2))
+      (setstate fflags (or i5 fflags (rv_quiet_nv64 rs1 rs2)) i5))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Ordered comparison writing 0 or 1 to an integer register"))
+
+  (definstruction FCVT_W_D
+    (mnemonic FCVT_W_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 97) (rm 1) (rs2 0))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fcvt.w.d $rd, $rs1")
+    (semantics "Convert to a signed 32-bit integer, toward zero and saturating")
+    (behavior
+      (set rd (fcvt_f2s i32 64 rs1))
+      (setstate fflags (or i5 fflags (fcvt_f2s_fx i32 64 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert to a signed 32-bit integer, toward zero and saturating"))
+
+  (definstruction FCVT_WU_D
+    (mnemonic FCVT_WU_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 97) (rm 1) (rs2 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fcvt.wu.d $rd, $rs1")
+    (semantics "Convert to an unsigned 32-bit integer, toward zero and saturating")
+    (behavior
+      (set rd (fcvt_f2u i32 64 rs1))
+      (setstate fflags (or i5 fflags (fcvt_f2u_fx i32 64 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert to an unsigned 32-bit integer, toward zero and saturating"))
+
+  (definstruction FCVT_D_W
+    (mnemonic FCVT_D_W)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 105) (rm 0) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_gpr i32 in))
+    (asm "fcvt.d.w $rd, $rs1")
+    (semantics "Convert a signed 32-bit integer to a float")
+    (behavior
+      (set rd (fcvt_s2f f64 32 rs1))
+      (setstate fflags (or i5 fflags (fcvt_s2f_fx f64 32 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert a signed 32-bit integer to a float"))
+
+  (definstruction FCVT_D_WU
+    (mnemonic FCVT_D_WU)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 105) (rm 0) (rs2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_gpr i32 in))
+    (asm "fcvt.d.wu $rd, $rs1")
+    (semantics "Convert an unsigned 32-bit integer to a float")
+    (behavior
+      (set rd (fcvt_u2f f64 32 rs1))
+      (setstate fflags (or i5 fflags (fcvt_u2f_fx f64 32 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert an unsigned 32-bit integer to a float"))
+
+  (definstruction FCVT_D_S
+    (mnemonic FCVT_D_S)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 33) (rm 0) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fcvt.d.s $rd, $rs1")
+    (semantics "Convert single to double, rounding to nearest even")
+    (behavior
+      (set rd (fcvt_f2f f64 32 rs1))
+      (setstate fflags (or i5 fflags (fcvt_f2f_fx f64 32 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert single to double"))
+
+  (definstruction FCVT_S_D
+    (mnemonic FCVT_S_D)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 32) (rm 0) (rs2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fcvt.s.d $rd, $rs1")
+    (semantics "Convert double to single, rounding to nearest even")
+    (behavior
+      (set rd (fcvt_f2f f32 64 rs1))
+      (setstate fflags (or i5 fflags (fcvt_f2f_fx f32 64 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Convert double to single"))
+
+  ; --- Round to nearest, ties away from zero (rm = 100) ------------------
+  ;
+  ; RMM is a fifth mode: RISC-V has it and AArch64, whose FPCR encoding the
+  ; `_rm` operators carry, does not. It differs from RNE in exactly one
+  ; situation -- the exact result sits halfway between two representables --
+  ; and agrees everywhere else, which is why only a witness on a tie can
+  ; tell them apart.
+  ;
+  ; The golden model decides "halfway" with exact rationals and SMT names it
+  ; `RNA`. C declines these: `fesetround` has no ties-away direction, C23
+  ; makes `FE_TONEARESTFROMZERO` optional and it is absent here, and the
+  ; two-bit mask this header applies would give ties-*even* silently.
+  ; Rust and LLVM already decline every directed rounding mode.
+
+  (definstruction FADD_S_RMM
+    (mnemonic FADD_S_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 0) (rm 4))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.s $rd, $rs1, $rs2, rmm")
+    (semantics "fadd under RMM rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fadd_rm f32 4 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fadd_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RMM rounding"))
+
+  (definstruction FSUB_S_RMM
+    (mnemonic FSUB_S_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 4) (rm 4))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.s $rd, $rs1, $rs2, rmm")
+    (semantics "fsub under RMM rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsub_rm f32 4 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsub_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RMM rounding"))
+
+  (definstruction FMUL_S_RMM
+    (mnemonic FMUL_S_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 8) (rm 4))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.s $rd, $rs1, $rs2, rmm")
+    (semantics "fmul under RMM rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fmul_rm f32 4 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fmul_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RMM rounding"))
+
+  (definstruction FDIV_S_RMM
+    (mnemonic FDIV_S_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 12) (rm 4))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.s $rd, $rs1, $rs2, rmm")
+    (semantics "fdiv under RMM rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fdiv_rm f32 4 rs1 rs2)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fdiv_fx f32 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RMM rounding"))
+
+  (definstruction FSQRT_S_RMM
+    (mnemonic FSQRT_S_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 44) (rm 4) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.s $rd, $rs1, rmm")
+    (semantics "Square root under RMM rounding")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fsqrt_rm f32 4 rs1)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fsqrt_fx f32 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RMM rounding"))
+
+  (definstruction FMADD_S_RMM
+    (mnemonic FMADD_S_RMM)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 4)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.s $rd, $rs1, $rs2, $rs3, rmm")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RTZ")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 4 rs1 rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FMADD_D_RMM
+    (mnemonic FMADD_D_RMM)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 4)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.d $rd, $rs1, $rs2, $rs3, rmm")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RTZ")
+    (behavior
+      (set rd (fma_rm f64 4 rs1 rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FMSUB_S_RMM
+    (mnemonic FMSUB_S_RMM)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 4)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.s $rd, $rs1, $rs2, $rs3, rmm")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RTZ")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 4 rs1 rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FMSUB_D_RMM
+    (mnemonic FMSUB_D_RMM)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 4)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.d $rd, $rs1, $rs2, $rs3, rmm")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RTZ")
+    (behavior
+      (set rd (fma_rm f64 4 rs1 rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FNMSUB_S_RMM
+    (mnemonic FNMSUB_S_RMM)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 4)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.s $rd, $rs1, $rs2, $rs3, rmm")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RTZ")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 4 (fneg f32 rs1) rs2 rs3)) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FNMSUB_D_RMM
+    (mnemonic FNMSUB_D_RMM)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 4)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.d $rd, $rs1, $rs2, $rs3, rmm")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RTZ")
+    (behavior
+      (set rd (fma_rm f64 4 (fneg f64 rs1) rs2 rs3))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 rs3)) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FNMADD_S_RMM
+    (mnemonic FNMADD_S_RMM)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 4)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.s $rd, $rs1, $rs2, $rs3, rmm")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RTZ")
+    (behavior
+      (set rd (or i64 (zext i64 32 (fma_rm f32 4 (fneg f32 rs1) rs2 (fneg f32 rs3))) 0xffffffff00000000))
+      (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 (fneg f32 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FNMADD_D_RMM
+    (mnemonic FNMADD_D_RMM)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 4)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.d $rd, $rs1, $rs2, $rs3, rmm")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RTZ")
+    (behavior
+      (set rd (fma_rm f64 4 (fneg f64 rs1) rs2 (fneg f64 rs3)))
+      (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 (fneg f64 rs3))) i5))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FADD_D_RMM
+    (mnemonic FADD_D_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 1) (rm 4))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.d $rd, $rs1, $rs2, rmm")
+    (semantics "fadd under RMM rounding")
+    (behavior
+      (set rd (fadd_rm f64 4 rs1 rs2))
+      (setstate fflags (or i5 fflags (fadd_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under RMM rounding"))
+
+  (definstruction FSUB_D_RMM
+    (mnemonic FSUB_D_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 5) (rm 4))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.d $rd, $rs1, $rs2, rmm")
+    (semantics "fsub under RMM rounding")
+    (behavior
+      (set rd (fsub_rm f64 4 rs1 rs2))
+      (setstate fflags (or i5 fflags (fsub_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under RMM rounding"))
+
+  (definstruction FMUL_D_RMM
+    (mnemonic FMUL_D_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 9) (rm 4))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.d $rd, $rs1, $rs2, rmm")
+    (semantics "fmul under RMM rounding")
+    (behavior
+      (set rd (fmul_rm f64 4 rs1 rs2))
+      (setstate fflags (or i5 fflags (fmul_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under RMM rounding"))
+
+  (definstruction FDIV_D_RMM
+    (mnemonic FDIV_D_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 13) (rm 4))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.d $rd, $rs1, $rs2, rmm")
+    (semantics "fdiv under RMM rounding")
+    (behavior
+      (set rd (fdiv_rm f64 4 rs1 rs2))
+      (setstate fflags (or i5 fflags (fdiv_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under RMM rounding"))
+
+  (definstruction FSQRT_D_RMM
+    (mnemonic FSQRT_D_RMM)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 45) (rm 4) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.d $rd, $rs1, rmm")
+    (semantics "Square root under RMM rounding")
+    (behavior
+      (set rd (fsqrt_rm f64 4 rs1))
+      (setstate fflags (or i5 fflags (fsqrt_fx f64 rs1)) i5))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under RMM rounding"))
+
+  ; --- Dynamic rounding (rm = 111) ---------------------------------------
+  ;
+  ; `DYN` takes its rounding mode from `fcsr.frm` at execution rather than
+  ; from the encoding, which is how essentially all compiled RISC-V float
+  ; code runs. It needs nothing the language did not already have: a mode
+  ; is an ordinary argument to a `_rm` operator, and a behavior can read
+  ; ISA state where a `formal` cannot.
+  ;
+  ; The reserved modes trap rather than round. `frm` 5 and 6 are reserved
+  ; and 7 is invalid in `fcsr`, so `frm >= 5` is an illegal instruction --
+  ; which is what the hardware does. 4 is RMM and is now described, so it
+  ; rounds rather than trapping.
+
+  (definstruction FADD_S_DYN
+    (mnemonic FADD_S_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 0) (rm 7))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.s $rd, $rs1, $rs2")
+    (semantics "fadd under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (or i64 (zext i64 32 (fadd_rm f32 frm rs1 rs2)) 0xffffffff00000000)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fadd_fx f32 rs1 rs2)) i5)))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under the mode `fcsr.frm` names"))
+
+  (definstruction FSUB_S_DYN
+    (mnemonic FSUB_S_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 4) (rm 7))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.s $rd, $rs1, $rs2")
+    (semantics "fsub under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (or i64 (zext i64 32 (fsub_rm f32 frm rs1 rs2)) 0xffffffff00000000)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fsub_fx f32 rs1 rs2)) i5)))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under the mode `fcsr.frm` names"))
+
+  (definstruction FMUL_S_DYN
+    (mnemonic FMUL_S_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 8) (rm 7))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.s $rd, $rs1, $rs2")
+    (semantics "fmul under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (or i64 (zext i64 32 (fmul_rm f32 frm rs1 rs2)) 0xffffffff00000000)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fmul_fx f32 rs1 rs2)) i5)))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under the mode `fcsr.frm` names"))
+
+  (definstruction FDIV_S_DYN
+    (mnemonic FDIV_S_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 12) (rm 7))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.s $rd, $rs1, $rs2")
+    (semantics "fdiv under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (or i64 (zext i64 32 (fdiv_rm f32 frm rs1 rs2)) 0xffffffff00000000)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fdiv_fx f32 rs1 rs2)) i5)))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under the mode `fcsr.frm` names"))
+
+  (definstruction FSQRT_S_DYN
+    (mnemonic FSQRT_S_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 44) (rm 7) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.s $rd, $rs1")
+    (semantics "Square root under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (or i64 (zext i64 32 (fsqrt_rm f32 frm rs1)) 0xffffffff00000000)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fsqrt_fx f32 rs1)) i5)))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under the mode `fcsr.frm` names"))
+
+  (definstruction FMADD_S_DYN
+    (mnemonic FMADD_S_DYN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 7)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.s $rd, $rs1, $rs2, $rs3")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RTZ")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (or i64 (zext i64 32 (fma_rm f32 frm rs1 rs2 rs3)) 0xffffffff00000000)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 rs3)) i5)))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FMADD_D_DYN
+    (mnemonic FMADD_D_DYN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x43)
+    (func3 7)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmadd.d $rd, $rs1, $rs2, $rs3")
+    (semantics "One rounding over rs1 * rs2 + rs3, under RTZ")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (fma_rm f64 frm rs1 rs2 rs3)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 rs3)) i5)))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FMSUB_S_DYN
+    (mnemonic FMSUB_S_DYN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 7)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.s $rd, $rs1, $rs2, $rs3")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RTZ")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (or i64 (zext i64 32 (fma_rm f32 frm rs1 rs2 (fneg f32 rs3))) 0xffffffff00000000)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fma_fx f32 rs1 rs2 (fneg f32 rs3))) i5)))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FMSUB_D_DYN
+    (mnemonic FMSUB_D_DYN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x47)
+    (func3 7)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fmsub.d $rd, $rs1, $rs2, $rs3")
+    (semantics "One rounding over rs1 * rs2 - rs3, under RTZ")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (fma_rm f64 frm rs1 rs2 (fneg f64 rs3))))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fma_fx f64 rs1 rs2 (fneg f64 rs3))) i5)))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FNMSUB_S_DYN
+    (mnemonic FNMSUB_S_DYN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 7)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.s $rd, $rs1, $rs2, $rs3")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RTZ")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (or i64 (zext i64 32 (fma_rm f32 frm (fneg f32 rs1) rs2 rs3)) 0xffffffff00000000)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 rs3)) i5)))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FNMSUB_D_DYN
+    (mnemonic FNMSUB_D_DYN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4b)
+    (func3 7)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmsub.d $rd, $rs1, $rs2, $rs3")
+    (semantics "One rounding over -(rs1 * rs2) + rs3, under RTZ")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (fma_rm f64 frm (fneg f64 rs1) rs2 rs3)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 rs3)) i5)))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FNMADD_S_DYN
+    (mnemonic FNMADD_S_DYN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 7)
+    (encoding (func2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.s $rd, $rs1, $rs2, $rs3")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RTZ")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (or i64 (zext i64 32 (fma_rm f32 frm (fneg f32 rs1) rs2 (fneg f32 rs3))) 0xffffffff00000000)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fma_fx f32 (fneg f32 rs1) rs2 (fneg f32 rs3))) i5)))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 9000.0)
+    (power-estimate-mw 12.0)
+    (expected-speedup 1.0)
+    (rationale "RV32S fused multiply-add under RTZ"))
+
+  (definstruction FNMADD_D_DYN
+    (mnemonic FNMADD_D_DYN)
+    (isa rv32i)
+    (category custom)
+    (format R4)
+    (opcode 0x4f)
+    (func3 7)
+    (encoding (func2 1))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in)
+      (rs3 rv_fpr i64 in))
+    (asm "fnmadd.d $rd, $rs1, $rs2, $rs3")
+    (semantics "One rounding over -(rs1 * rs2) - rs3, under RTZ")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (fma_rm f64 frm (fneg f64 rs1) rs2 (fneg f64 rs3))))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fma_fx f64 (fneg f64 rs1) rs2 (fneg f64 rs3))) i5)))
+    (latency 5)
+    (throughput 1.0)
+    (area-estimate-um2 12000.0)
+    (power-estimate-mw 16.0)
+    (expected-speedup 1.0)
+    (rationale "RV32D fused multiply-add under RTZ"))
+
+  (definstruction FADD_D_DYN
+    (mnemonic FADD_D_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 1) (rm 7))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fadd.d $rd, $rs1, $rs2")
+    (semantics "fadd under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (fadd_rm f64 frm rs1 rs2)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fadd_fx f64 rs1 rs2)) i5)))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fadd under the mode `fcsr.frm` names"))
+
+  (definstruction FSUB_D_DYN
+    (mnemonic FSUB_D_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 5) (rm 7))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fsub.d $rd, $rs1, $rs2")
+    (semantics "fsub under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (fsub_rm f64 frm rs1 rs2)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fsub_fx f64 rs1 rs2)) i5)))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fsub under the mode `fcsr.frm` names"))
+
+  (definstruction FMUL_D_DYN
+    (mnemonic FMUL_D_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 9) (rm 7))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fmul.d $rd, $rs1, $rs2")
+    (semantics "fmul under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (fmul_rm f64 frm rs1 rs2)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fmul_fx f64 rs1 rs2)) i5)))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fmul under the mode `fcsr.frm` names"))
+
+  (definstruction FDIV_D_DYN
+    (mnemonic FDIV_D_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 13) (rm 7))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in)
+      (rs2 rv_fpr i64 in))
+    (asm "fdiv.d $rd, $rs1, $rs2")
+    (semantics "fdiv under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (fdiv_rm f64 frm rs1 rs2)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fdiv_fx f64 rs1 rs2)) i5)))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "fdiv under the mode `fcsr.frm` names"))
+
+  (definstruction FSQRT_D_DYN
+    (mnemonic FSQRT_D_DYN)
+    (isa rv32i)
+    (category custom)
+    (format RV_FP)
+    (opcode 0x53)
+    (encoding (func7 45) (rm 7) (rs2 0))
+    (operands
+      (rd rv_fpr i64 out)
+      (rs1 rv_fpr i64 in))
+    (asm "fsqrt.d $rd, $rs1")
+    (semantics "Square root under the mode `fcsr.frm` names")
+    (behavior
+      (when (icmp_uge frm 5) (trap illegal))
+      (when (icmp_ult frm 5)
+        (set rd (fsqrt_rm f64 frm rs1)))
+      (when (icmp_ult frm 5)
+        (setstate fflags (or i5 fflags (fsqrt_fx f64 rs1)) i5)))
+    (latency 12)
+    (throughput 1.0)
+    (area-estimate-um2 6000.0)
+    (power-estimate-mw 8.0)
+    (expected-speedup 1.0)
+    (rationale "Square root under the mode `fcsr.frm` names"))
+
+
+  ; --- Zicsr: the control and status registers ---------------------------
+  ;
+  ; A CSR is selected by a twelve-bit field of the encoding, and AXIS names its
+  ; architectural state statically -- so one instruction addressing all 4096
+  ; registers is not describable, and would not be worth describing: this
+  ; machine has one CSR whose value anything reads. `frm` is at 0x002, the
+  ; instructions below pin that field, and each says which state slot it
+  ; touches by name.
+  ;
+  ; They exist because the DYN forms read `frm` and nothing could write it.
+  ; A description with a read-only mode register describes a machine on which
+  ; dynamic rounding cannot be selected, which is not the machine RISC-V
+  ; specifies.
+  ;
+  ; The spec's two no-side-effect rules need no guard here. CSRRS/CSRRC with
+  ; `rs1` = x0 must not write the CSR, and `x | 0` and `x & ~0` are both the
+  ; identity, so the plain description already writes back what was there.
+  ; CSRRW with `rd` = x0 must not *read* it, and reading `frm` has no side
+  ; effect to suppress.
+
+  (definstruction CSRRW_FRM
+    (mnemonic CSRRW_FRM)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x73)
+    (func3 1)
+    (encoding (imm 2))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "csrrw $rd, frm, $rs1")
+    (semantics "CSR swap: read `frm`, write the register")
+    (behavior
+      (set rd (zext i32 3 frm))
+      (setstate frm rs1 i3))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the dynamic rounding mode"))
+
+  (definstruction CSRRS_FRM
+    (mnemonic CSRRS_FRM)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x73)
+    (func3 2)
+    (encoding (imm 2))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "csrrs $rd, frm, $rs1")
+    (semantics "CSR set: read `frm`, set the bits the register names")
+    (behavior
+      (set rd (zext i32 3 frm))
+      (setstate frm (or i3 frm rs1) i3))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the dynamic rounding mode"))
+
+  (definstruction CSRRC_FRM
+    (mnemonic CSRRC_FRM)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x73)
+    (func3 3)
+    (encoding (imm 2))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "csrrc $rd, frm, $rs1")
+    (semantics "CSR clear: read `frm`, clear the bits the register names")
+    (behavior
+      (set rd (zext i32 3 frm))
+      (setstate frm (and i3 frm (xor i3 rs1 7)) i3))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the dynamic rounding mode"))
+
+  (definstruction CSRRWI_FRM
+    (mnemonic CSRRWI_FRM)
+    (isa rv32i)
+    (category custom)
+    (format RV_CSRI)
+    (opcode 0x73)
+    (func3 5)
+    (encoding (imm 2))
+    (operands
+      (rd rv_gpr i32 out)
+      (uimm imm i5 in))
+    (asm "csrrwi $rd, frm, $uimm")
+    (semantics "CSR swap immediate: read `frm`, write the immediate")
+    (behavior
+      (set rd (zext i32 3 frm))
+      (setstate frm uimm i3))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the dynamic rounding mode"))
+
+  (definstruction CSRRSI_FRM
+    (mnemonic CSRRSI_FRM)
+    (isa rv32i)
+    (category custom)
+    (format RV_CSRI)
+    (opcode 0x73)
+    (func3 6)
+    (encoding (imm 2))
+    (operands
+      (rd rv_gpr i32 out)
+      (uimm imm i5 in))
+    (asm "csrrsi $rd, frm, $uimm")
+    (semantics "CSR set immediate: read `frm`, set the bits the immediate names")
+    (behavior
+      (set rd (zext i32 3 frm))
+      (setstate frm (or i3 frm uimm) i3))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the dynamic rounding mode"))
+
+  (definstruction CSRRCI_FRM
+    (mnemonic CSRRCI_FRM)
+    (isa rv32i)
+    (category custom)
+    (format RV_CSRI)
+    (opcode 0x73)
+    (func3 7)
+    (encoding (imm 2))
+    (operands
+      (rd rv_gpr i32 out)
+      (uimm imm i5 in))
+    (asm "csrrci $rd, frm, $uimm")
+    (semantics "CSR clear immediate: read `frm`, clear the bits the immediate names")
+    (behavior
+      (set rd (zext i32 3 frm))
+      (setstate frm (and i3 frm (xor i3 uimm 7)) i3))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the dynamic rounding mode"))
+
+  ; `fflags` at 0x001, beside `frm` at 0x002. Arithmetic only ever accrues
+  ; bits -- `(or i5 fflags ...)` -- so a CSR write is the only way a program
+  ; clears them, and without these the flags would be a register that fills up
+  ; and never empties.
+
+  (definstruction CSRRW_FFLAGS
+    (mnemonic CSRRW_FFLAGS)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x73)
+    (func3 1)
+    (encoding (imm 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "csrrw $rd, fflags, $rs1")
+    (semantics "CSR swap: read the accrued exception flags")
+    (behavior
+      (set rd (zext i32 5 fflags))
+      (setstate fflags rs1 i5))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the accrued floating-point exception flags"))
+
+  (definstruction CSRRS_FFLAGS
+    (mnemonic CSRRS_FFLAGS)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x73)
+    (func3 2)
+    (encoding (imm 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "csrrs $rd, fflags, $rs1")
+    (semantics "CSR set: read the accrued exception flags")
+    (behavior
+      (set rd (zext i32 5 fflags))
+      (setstate fflags (or i5 fflags rs1) i5))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the accrued floating-point exception flags"))
+
+  (definstruction CSRRC_FFLAGS
+    (mnemonic CSRRC_FFLAGS)
+    (isa rv32i)
+    (category custom)
+    (format I)
+    (opcode 0x73)
+    (func3 3)
+    (encoding (imm 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in))
+    (asm "csrrc $rd, fflags, $rs1")
+    (semantics "CSR clear: read the accrued exception flags")
+    (behavior
+      (set rd (zext i32 5 fflags))
+      (setstate fflags (and i5 fflags (xor i5 rs1 31)) i5))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the accrued floating-point exception flags"))
+
+  (definstruction CSRRWI_FFLAGS
+    (mnemonic CSRRWI_FFLAGS)
+    (isa rv32i)
+    (category custom)
+    (format RV_CSRI)
+    (opcode 0x73)
+    (func3 5)
+    (encoding (imm 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (uimm imm i5 in))
+    (asm "csrrwi $rd, fflags, $uimm")
+    (semantics "CSR swap immediate: read the accrued exception flags")
+    (behavior
+      (set rd (zext i32 5 fflags))
+      (setstate fflags uimm i5))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the accrued floating-point exception flags"))
+
+  (definstruction CSRRSI_FFLAGS
+    (mnemonic CSRRSI_FFLAGS)
+    (isa rv32i)
+    (category custom)
+    (format RV_CSRI)
+    (opcode 0x73)
+    (func3 6)
+    (encoding (imm 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (uimm imm i5 in))
+    (asm "csrrsi $rd, fflags, $uimm")
+    (semantics "CSR set immediate: read the accrued exception flags")
+    (behavior
+      (set rd (zext i32 5 fflags))
+      (setstate fflags (or i5 fflags uimm) i5))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the accrued floating-point exception flags"))
+
+  (definstruction CSRRCI_FFLAGS
+    (mnemonic CSRRCI_FFLAGS)
+    (isa rv32i)
+    (category custom)
+    (format RV_CSRI)
+    (opcode 0x73)
+    (func3 7)
+    (encoding (imm 1))
+    (operands
+      (rd rv_gpr i32 out)
+      (uimm imm i5 in))
+    (asm "csrrci $rd, fflags, $uimm")
+    (semantics "CSR clear immediate: read the accrued exception flags")
+    (behavior
+      (set rd (zext i32 5 fflags))
+      (setstate fflags (and i5 fflags (xor i5 uimm 31)) i5))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Zicsr access to the accrued floating-point exception flags"))
+
+  ; An ABI is not derivable from an instruction set (L4). Which register holds
+  ; the first argument is a property of a platform, and a description that
+  ; guessed would be inventing a convention rather than generating one. So it
+  ; is declared -- and what a declaration can be held to is whether it is
+  ; consistent with itself, which is the class of mistake a compiler acts on
+  ; silently.
+  ;
+  ; This is RISC-V's ILP32 with soft float: the `rv_fpr` file is named in no
+  ; role, which is what a soft-float convention *is*, rather than an omission.
+  (defabi ilp32
+    (isa rv32i)
+    (pointer-bits 32)
+    (stack-alignment 16)
+    ; Reserved by definition: an allocatable stack pointer is not a stack
+    ; pointer, and x0 discards what is written to it.
+    (stack-pointer (rv_gpr 2))
+    ; Callee-saved by definition: a frame pointer the callee does not preserve
+    ; is not a frame pointer.
+    (frame-pointer (rv_gpr 8))
+    (link-register (rv_gpr 1))
+    (arguments (rv_gpr 10 17))
+    (returns (rv_gpr 10 11))
+    (callee-saved (rv_gpr 8 9) (rv_gpr 18 27))
+    (caller-saved (rv_gpr 1) (rv_gpr 5 7) (rv_gpr 10 17) (rv_gpr 28 31))
+    (reserved (rv_gpr 0) (rv_gpr 2) (rv_gpr 3) (rv_gpr 4))
+    ; The frame (F1), and it is the one a consumer of this description already
+    ; writes by hand: `pce/hardware/grv/grv_linked_execution.py` checks a
+    ; prologue of `addi sp, sp, -16 / sw ra, 12(sp) / sw s0, 8(sp) /
+    ; addi s0, sp, 16` against hand-encoded words. The layout below computes
+    ; those same offsets -- ra at the top slot, s0 beneath it -- from the order
+    ; the registers are saved in.
+    ;
+    ; `ra` is caller-saved and still saved here, which is not a contradiction:
+    ; a non-leaf callee clobbers it by calling, so it saves it for the caller.
+    ; That is why the rule is "callee-saved, or the link register" and not
+    ; "callee-saved".
+    (frame
+      (growth down)
+      (saved-area top)
+      (slot-bytes 4)
+      (save-order (rv_gpr 1) (rv_gpr 8))
+      (frame-pointer-at incoming-sp)
+      ; 2048, because that is where `sw`'s signed 12-bit offset stops: the
+      ; instruction set decides how big a frame the adjustment can open in one
+      ; step, and the gate checks this number against it rather than trusting
+      ; it.
+      (max-frame-bytes 2048)
+      (red-zone 0)
+      (adjust ADDI)
+      (save SW)
+      (restore LW)
+      ; The frame's regions, lowest address first (F4). No sizes: how many
+      ; spill slots a function needs and how big its locals are is the register
+      ; allocator's decision, made per function, and a description that stated
+      ; it would be stating what it cannot know. The order is the platform's,
+      ; and it has consequences -- the outgoing-argument area is at the frame
+      ; base because that is where the callee's own stack pointer finds it.
+      (regions outgoing locals spill saved)
+      ; What one register costs when it is spilled. Machine data: a register
+      ; needs its own width wherever it is put.
+      (spill (rv_gpr 4 4) (rv_fpr 8 8))
+      ; The pointer discipline (F5). Realignment moves the frame away from the
+      ; incoming stack pointer; dynamic allocation moves the stack pointer away
+      ; from the frame. Either alone leaves one pointer that still reaches a
+      ; local. This abi permits dynamic allocation and not realignment, so the
+      ; frame pointer is enough and no base pointer is declared.
+      (realignment forbidden)
+      (dynamic-allocation allowed))
+    ; How a laid-out aggregate is passed (F3). Not how it is laid out: padding
+    ; and nested alignment are C's rule, not the machine's, and they belong to
+    ; whoever defines the source language. Two registers' worth by value, the
+    ; rest by reference, and a returned aggregate's address arrives in the
+    ; first argument register -- which is why the rule is that it has to *be*
+    ; an argument register.
+    (aggregates
+      (max-register-bytes 8)
+      (split allowed)
+      (return-pointer (rv_gpr 10)))
+    (description "RISC-V ILP32, soft float"))
+)

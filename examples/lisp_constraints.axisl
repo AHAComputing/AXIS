@@ -1,0 +1,24 @@
+; Boolean decode legality is authored as ordinary Lisp and lowered once into
+; a canonical constraint tree shared by encoders, decoders, and lifters.
+(axis-module lisp-constraints
+  (version "0.2.0")
+  (target generic)
+
+  (defformat constrained
+    (bits 32)
+    (fields
+      (fixed 31 6)
+      (amount 5 3)
+      (option 2 0)))
+
+  (definstruction BOUNDED-OPTION
+    (mnemonic BOUNDED_OPTION)
+    (format constrained)
+    (encoding (fixed #b01010101010101010101010101))
+    (operands
+      (amount imm i3 in)
+      (option imm i3 in))
+    (asm "bounded.option $amount, $option")
+    (requires
+      (and (< amount 5)
+           (not (= option 7))))))

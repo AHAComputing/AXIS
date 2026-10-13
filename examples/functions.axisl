@@ -1,0 +1,84 @@
+;; Description-defined functions (`deffun`), stage F1.
+;;
+;; A `defsem` is substituted where it is used, and every backend pastes a bound
+;; value's text where it is read -- so a definition that names its parameters
+;; several times, nested, grows exponentially: SVE's FMAXV over halves rendered
+;; to 142 MB of C. A `deffun` is emitted once by every backend and CALLED:
+;; `(name args...)` in a description elaborates to `(call name iR (iP arg) ...)`,
+;; each argument read at its parameter's width, and every backend -- the golden
+;; model, C, Rust, LLVM, SMT, the executors -- keeps it a call.
+;;
+;; This corpus holds the shapes a call can take: plain, with narrower
+;; parameters than the instruction's operands, a function calling a function, a
+;; `defsem` inlined inside a function's body, and a call nested eight deep
+;; whose inlined text would be 3^8 copies of its innermost argument.
+(axis-module functions
+  (version "1.0")
+  (target rvmt)
+  (description "deffun: functions emitted once and called")
+
+  ; Inlined, as every defsem is -- here inside a function's body.
+  (defsem rotl32 ((x i32) (n i32)) i32 (rol i32 x n))
+
+  ; Each parameter read three times: inlined and nested, this triples per level.
+  (deffun mix ((a i32) (b i32)) i32
+    (xor i32 (add i32 a b) (xor i32 (rotl32 a 7) (sub i32 b (rotl32 a 13)))))
+
+  ; A narrow function: a 4-bit S-box over the low nibble.
+  (deffun nibble_sbox ((x i8)) i8
+    (let ((n (and i8 x 15)))
+      (select i8 (icmp_ult i8 n 8)
+        (select i8 (icmp_ult i8 n 4)
+          (select i8 (icmp_ult i8 n 2) (select i8 (icmp_eq i8 n 0) 12 5) (select i8 (icmp_eq i8 n 2) 6 11))
+          (select i8 (icmp_ult i8 n 6) (select i8 (icmp_eq i8 n 4) 9 0) (select i8 (icmp_eq i8 n 6) 10 13)))
+        (select i8 (icmp_ult i8 n 12)
+          (select i8 (icmp_ult i8 n 10) (select i8 (icmp_eq i8 n 8) 3 14) (select i8 (icmp_eq i8 n 10) 15 8))
+          (select i8 (icmp_ult i8 n 14) (select i8 (icmp_eq i8 n 12) 4 7) (select i8 (icmp_eq i8 n 14) 1 2))))))
+
+  ; A function calling functions.
+  (deffun sbox_bytes ((x i32)) i32
+    (or i32 (zext i32 8 (nibble_sbox (and i8 x 255)))
+            (shl i32 (zext i32 8 (nibble_sbox (and i8 (lshr i32 x 8) 255))) 8)))
+
+  (definstruction fmix
+    (mnemonic FMIX)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 0)
+    (func7 3)
+    (operands (rd reg i32 out) (rs1 reg i32 in) (rs2 reg i32 in))
+    (semantics "rd = mix(rs1, rs2)")
+    (formal (mix rs1 rs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "A plain call."))
+
+  (definstruction fsbox
+    (mnemonic FSBOX)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 1)
+    (func7 3)
+    (operands (rd reg i32 out) (rs1 reg i32 in) (rs2 reg i32 in))
+    (semantics "rd = the nibble S-box of the low two bytes of rs1, plus rs2")
+    (formal (add i32 (sbox_bytes rs1) rs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "A function calling a narrower function."))
+
+  (definstruction fnest
+    (mnemonic FNEST)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 2)
+    (func7 3)
+    (operands (rd reg i32 out) (rs1 reg i32 in) (rs2 reg i32 in))
+    (semantics "rd = mix applied eight deep")
+    (formal (mix (mix (mix (mix (mix (mix (mix (mix rs1 rs2) rs2) rs1) rs2) rs1) rs2) rs1) rs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "Eight nested calls: inlined, 3^8 copies of the innermost argument; called, eight calls."))
+)

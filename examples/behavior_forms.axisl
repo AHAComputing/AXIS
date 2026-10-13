@@ -1,0 +1,121 @@
+; The elaboration passes reach the effect surface (docs/tensor_design.md, T8).
+;
+; AXIS turns source-level shorthand into ordinary semantics at elaboration:
+; bounded loops and contractions (T6b), SIMD lanes, the interchange float
+; formats (T1b, T1c). Every one of those passes ran on `formal_semantics` and
+; NONE of them ran on behaviors.
+;
+; That was not a small omission, because the effect surface is where MEMORY is.
+; A contraction over loaded values, a lane-wise conversion of a loaded vector,
+; a tile read through an access map and accumulated -- every one of those is a
+; behavior, so none could be written. And they did not fail helpfully:
+; `(accumulate ...)` in a behavior reached validation as "unsupported
+; formal_semantics operator `accumulate`", a message about the typed IR rather
+; than about the form.
+;
+; This corpus is pairs. Each shorthand appears twice -- once as a `formal`, once
+; inside a behavior whose result is stored -- and tools/behavior_forms_check.py
+; requires the two to elaborate to the SAME expression. The same shorthand must
+; mean the same thing in both surfaces, which is the only property worth having
+; here and the one that fails if a pass is wired into one and not the other.
+;
+; ⚠️ The boundary that remains, stated rather than discovered: a `load` may
+; only be the TOP-LEVEL expression of an effect value. So `(accumulate ... (load
+; ...))` and `(fcvt_f2f f32 bf16 (load ...))` are refused -- not because the
+; passes do not reach them, but because the effect model allows one load per
+; effect. That is what stops a kernel whose terms are memory reads from being
+; composed out of the mechanisms above, and it is measured here rather than
+; left to be met later.
+(axis-module behavior_forms
+  (version "0.1.0")
+  (target rvmt)
+  (description "Loop, lane and interchange forms mean the same in both surfaces")
+
+  (defisa both
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64")
+    (features simd fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat BOTH_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction dot_formal
+    (mnemonic DOT_FORMAL) (isa both) (category custom) (format BOTH_R)
+    (opcode 11) (func3 0) (func7 0) (encoding (rs2 0))
+    (operands (rd reg i64 out) (rs1 reg i64 in))
+    (asm "dot_formal $rd, $rs1")
+    (semantics "Eight byte squares summed, written as a value")
+    (formal (accumulate i64 add (k 8) (order exact)
+      (mul i64 (and i64 (lshr i64 rs1 (mul i64 k 8)) 255)
+               (and i64 (lshr i64 rs1 (mul i64 k 8)) 255))))
+    (latency 8) (throughput 0.5)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 4.0)
+    (rationale "The contraction as a value, which always worked"))
+
+  (definstruction dot_stored
+    (mnemonic DOT_STORED) (isa both) (category custom) (format BOTH_R)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (rd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "dot_stored $rd, $rs1, $rs2")
+    (semantics "The same contraction, stored")
+    (behavior (store rs2 (accumulate i64 add (k 8) (order exact)
+      (mul i64 (and i64 (lshr i64 rs1 (mul i64 k 8)) 255)
+               (and i64 (lshr i64 rs1 (mul i64 k 8)) 255))) i64))
+    (latency 8) (throughput 0.5)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 4.0)
+    (rationale "The same contraction in a behavior, which did not"))
+
+  (definstruction lanes_formal
+    (mnemonic LANES_FORMAL) (isa both) (category custom) (format BOTH_R)
+    (opcode 11) (func3 2) (func7 0) (encoding (rs2 0))
+    (operands (rd reg i64 out) (rs1 reg i64 in))
+    (asm "lanes_formal $rd, $rs1")
+    (semantics "Lane-wise doubling as a value")
+    (formal (add v2i32 rs1 rs1))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 300.0) (power-estimate-mw 0.4) (expected-speedup 2.0)
+    (rationale "Lanes as a value"))
+
+  (definstruction lanes_stored
+    (mnemonic LANES_STORED) (isa both) (category custom) (format BOTH_R)
+    (opcode 11) (func3 3) (func7 0)
+    (operands (rd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "lanes_stored $rd, $rs1, $rs2")
+    (semantics "The same lanes, stored")
+    (behavior (store rs2 (add v2i32 rs1 rs1) i64))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 300.0) (power-estimate-mw 0.4) (expected-speedup 2.0)
+    (rationale "Lanes in a behavior"))
+
+  (definstruction bf16_formal
+    (mnemonic BF16_FORMAL) (isa both) (category float) (format BOTH_R)
+    (opcode 11) (func3 4) (func7 0) (encoding (rs2 0))
+    (operands (rd reg i64 out) (rs1 reg i64 in))
+    (asm "bf16_formal $rd, $rs1")
+    (semantics "A bfloat16 widened, as a value")
+    (formal (fcvt_f2f f32 bf16 rs1))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 100.0) (power-estimate-mw 0.2) (expected-speedup 1.0)
+    (rationale "An interchange format as a value"))
+
+  (definstruction bf16_stored
+    (mnemonic BF16_STORED) (isa both) (category float) (format BOTH_R)
+    (opcode 11) (func3 5) (func7 0)
+    (operands (rd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "bf16_stored $rd, $rs1, $rs2")
+    (semantics "The same widening, stored")
+    (behavior (store rs2 (fcvt_f2f f32 bf16 rs1) i64))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 100.0) (power-estimate-mw 0.2) (expected-speedup 1.0)
+    (rationale "An interchange format in a behavior"))
+)

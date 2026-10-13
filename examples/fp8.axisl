@@ -1,0 +1,116 @@
+; The eight-bit formats (docs/tensor_design.md, T1c).
+;
+; Two of them are in common use and they are not variants of one thing. OCP's
+; e5m2 is IEEE-shaped: five exponent bits, two of mantissa, the top exponent
+; spent on infinities and NaN. OCP's e4m3 has four exponent bits, three of
+; mantissa, and NO INFINITIES -- it spends the all-ones exponent on finite
+; values and keeps a single pattern for NaN, which is why its largest is 448
+; where an IEEE format of the same size stops at 240.
+;
+; So `f8` is refused. A width does not choose between two formats, and the
+; refusal says that rather than picking one.
+;
+; Like bf16 (T1b) these expand at elaboration into integer bit work, and for
+; the same reason: the typed IR identifies a float format by its width, and
+; there are three eight-bit contenders before you count f16's collision at
+; sixteen. Unlike bf16 the arithmetic is not a shift -- the exponent fields are
+; narrower than f32's, so a conversion rebiases, and a subnormal has to be
+; renormalised.
+;
+; That renormalisation was predicted to need a loop. It does not, and the
+; reason is the format's own smallness: with two or three mantissa bits the
+; leading one is in two or three possible places, so finding it is a select
+; over those, not a search. The prediction generalised from f16, whose eleven
+; significand bits really would want a loop.
+;
+; What checks them is exact rational arithmetic, not a second copy of the
+; shifting. tools/fp8_check.py decodes each pattern to a Fraction from the
+; format's own fields, and rounds by finding the nearest representable value
+; and breaking ties towards the even pattern. All 256 widenings, both formats,
+; and narrowings driven onto every rounding boundary there is.
+;
+; F8_DOT is why these are here: two e4m3 operands widened and multiplied in
+; f32 is what an fp8 matrix unit does, and the accumulate form of T6b sums
+; them.
+(axis-module fp8
+  (version "0.1.0")
+  (target rvmt)
+  (description "OCP e4m3 and e5m2 conversions, and an fp8 product")
+
+  (defisa fp8isa
+    (base rv32im)
+    (word-bits 32)
+    (registers "q[32]:i32" "pc:i32")
+    (features fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat Q_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (qd 11 7)
+      (func3 14 12)
+      (qn 19 15)
+      (qm 24 20)
+      (func7 31 25)))
+
+  (definstruction f8_widen_e4m3
+    (mnemonic F8_WIDEN_E4M3) (isa fp8isa) (category float) (format Q_R)
+    (opcode 11) (func3 0) (func7 0)
+    (encoding (qm 0))
+    (operands (qd reg i32 out) (qn reg i32 in))
+    (asm "f8_widen_e4m3 $qd, $qn")
+    (semantics "e4m3 to single, exact for every pattern including the subnormals")
+    (formal (fcvt_f2f f32 f8e4m3 qn))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 300.0) (power-estimate-mw 0.4) (expected-speedup 1.0)
+    (rationale "Every eight-bit pattern has a single-precision value, so this rounds nothing"))
+
+  (definstruction f8_narrow_e4m3
+    (mnemonic F8_NARROW_E4M3) (isa fp8isa) (category float) (format Q_R)
+    (opcode 11) (func3 1) (func7 0)
+    (encoding (qm 0))
+    (operands (qd reg i32 out) (qn reg i32 in))
+    (asm "f8_narrow_e4m3 $qd, $qn")
+    (semantics "Single to e4m3, nearest-even, saturating at 448 because the format has no infinity")
+    (formal (fcvt_f2f f8e4m3 f32 qn))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 600.0) (power-estimate-mw 0.8) (expected-speedup 1.0)
+    (rationale "Saturation is the whole difference from an IEEE format of the same size"))
+
+  (definstruction f8_widen_e5m2
+    (mnemonic F8_WIDEN_E5M2) (isa fp8isa) (category float) (format Q_R)
+    (opcode 11) (func3 2) (func7 0)
+    (encoding (qm 0))
+    (operands (qd reg i32 out) (qn reg i32 in))
+    (asm "f8_widen_e5m2 $qd, $qn")
+    (semantics "e5m2 to single, infinities and all")
+    (formal (fcvt_f2f f32 f8e5m2 qn))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 280.0) (power-estimate-mw 0.4) (expected-speedup 1.0)
+    (rationale "The IEEE-shaped one, so the top exponent widens to an infinity"))
+
+  (definstruction f8_narrow_e5m2
+    (mnemonic F8_NARROW_E5M2) (isa fp8isa) (category float) (format Q_R)
+    (opcode 11) (func3 3) (func7 0)
+    (encoding (qm 0))
+    (operands (qd reg i32 out) (qn reg i32 in))
+    (asm "f8_narrow_e5m2 $qd, $qn")
+    (semantics "Single to e5m2, nearest-even, overflowing to infinity")
+    (formal (fcvt_f2f f8e5m2 f32 qn))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 580.0) (power-estimate-mw 0.8) (expected-speedup 1.0)
+    (rationale "Where e4m3 saturates, this one has somewhere to overflow to"))
+
+  (definstruction f8_dot
+    (mnemonic F8_DOT) (isa fp8isa) (category float) (format Q_R)
+    (opcode 11) (func3 4) (func7 0)
+    (operands (qd reg i32 out) (qn reg i32 in) (qm reg i32 in))
+    (asm "f8_dot $qd, $qn, $qm")
+    (semantics "Two e4m3 operands widened and multiplied in single precision")
+    (formal (fmul f32 (fcvt_f2f f32 f8e4m3 qn) (fcvt_f2f f32 f8e4m3 qm)))
+    (latency 5) (throughput 1.0)
+    (area-estimate-um2 1600.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "fp8 in, f32 out: what an fp8 matrix unit does, and the shape T6b accumulates"))
+)

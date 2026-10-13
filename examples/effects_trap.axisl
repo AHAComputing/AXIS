@@ -1,0 +1,36 @@
+(axis-module xtrap
+  (version "1.0")
+  (target rvmt)
+
+  (defisa rv32_trap
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32")
+    (features m custom)
+    (memory-model rvwmo)
+    (endianness little)
+  )
+
+  (definstruction teq_x
+    (mnemonic TEQ_X)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 4)
+    (func7 0)
+    (encoding (rd 0))
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+    )
+    (asm "teq_x $rs1, $rs2")
+    (behavior
+      (when (icmp_eq rs1 rs2) (trap illegal))
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+)

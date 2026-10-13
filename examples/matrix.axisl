@@ -1,0 +1,153 @@
+; A tile is a vector with a second index (docs/tensor_design.md, T3).
+;
+; The design for this stage proposed a `Shape::Matrix` beside `Scalar`, `Fixed`
+; and `Scalable`, and an effect ABI that could write one -- because an SME
+; FMOPA writes 1024 bits and `EFFECT_MAX_WRITES` budgets 256. Neither is built,
+; and neither is deferred: they turned out not to be needed.
+;
+; A tile IS a vector. 256 lanes of f32 are SME's ZA0.S at SVL = 512, and
+; lane-indexed instantiation has always turned one scalable instruction into
+; one ordinary instruction PER LANE -- so a tile operation is 256 single-write
+; instructions and the four-write budget is never reached. Measured before any
+; of this was written: a 256-lane instruction instantiates, and all six
+; backends emit it.
+;
+; What a matrix actually needs is not a shape but an INDEX FUNCTION, which is
+; the same thing the structured permutes already are:
+;
+;   (vrows <type> <cols> a)        element k reads a[k / cols]
+;   (vcols <type> <cols> b)        element k reads b[k % cols]
+;   (vtranspose <type> <cols> m)   element k reads m[(k % cols) * rows + k / cols]
+;
+; where `cols` is the column count of the RESULT. For a square tile that is
+; also the source's and the distinction does not arise -- which is precisely
+; why a square corpus could not tell a transpose using the wrong count apart,
+; and why the non-square pair below exists.
+;
+; The first two read a SHORTER operand than the result -- four lanes of `zn`
+; feeding sixteen lanes of tile -- which is what an outer product is, and it
+; falls out of the index rather than needing a second shape beside the first.
+;
+; So there is no `vmopa` here. An outer product is a multiply of a row
+; broadcast by a column broadcast, and SME's FMOPA is that added to the
+; accumulator: composed from three small maps rather than named as one big
+; operator, which is the same choice `vmerge` made for predication.
+;
+; The transpose is the horizontal-versus-vertical slice question in miniature:
+; same storage, two index functions. tools/matrix_check.py proves the three
+; maps against each other rather than against a restatement of themselves --
+; a transpose is its own inverse, transposing an outer product swaps its
+; operands, and transposing a row broadcast gives a column broadcast. A wrong
+; index in any one of them breaks at least two.
+(axis-module matrix
+  (version "0.1.0")
+  (target rvmt)
+  (description "Outer products and transposes over a tile held as lanes")
+
+  (defisa za
+    (base rv64im)
+    (word-bits 64)
+    (vector-bits 512)
+    (registers "z[16]:i512" "pc:i64")
+    (features simd scalable fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat ZA_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (zm 24 20)
+      (func7 31 25)))
+
+  (definstruction smopa
+    (mnemonic SMOPA) (isa za) (category simd) (format ZA_R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "smopa $zd, $zn, $zm")
+    (semantics "Integer outer product: element (i, j) is zn[i] times zm[j]")
+    (formal (mul vni32 (vrows vni32 4 zn) (vcols vni32 4 zm)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 6000.0) (power-estimate-mw 8.0) (expected-speedup 8.0)
+    (rationale "An outer product is a row broadcast times a column broadcast, and nothing else"))
+
+  (definstruction fmopa
+    (mnemonic FMOPA) (isa za) (category simd) (format ZA_R)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "fmopa $zd, $zn, $zm")
+    (semantics "Single-precision outer product, the shape SME's FMOPA writes")
+    (formal (fmul vnf32 (vrows vnf32 4 zn) (vcols vnf32 4 zm)))
+    (latency 6) (throughput 1.0)
+    (area-estimate-um2 9000.0) (power-estimate-mw 12.0) (expected-speedup 8.0)
+    (rationale "The float case differs from the integer one in the element operator alone"))
+
+  (definstruction tile_transpose
+    (mnemonic TILE_TRANSPOSE) (isa za) (category simd) (format ZA_R)
+    (opcode 11) (func3 2) (func7 0)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "tile_transpose $zd, $zn")
+    (semantics "Read a four-by-four tile column-major where it was written row-major")
+    (formal (vtranspose vni32 4 zn))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 2.5) (expected-speedup 4.0)
+    (rationale "A vertical slice is a horizontal one under a different index, which is the whole claim"))
+
+  ; ⚠️ A NON-SQUARE pair, and the reason is an injection that passed. With a
+  ; four-by-four tile the row count and the column count are the same number,
+  ; so a transpose that used the wrong one computed the right answer and the
+  ; gate said PASS. Two by eight and its inverse eight by two are what make
+  ; that mistake visible -- and they are the common shape anyway: an AMX tile
+  ; is sixteen by sixty-four, and only SME's ZA is square.
+  (definstruction tile_t_8
+    (mnemonic TILE_T_8) (isa za) (category simd) (format ZA_R)
+    (opcode 11) (func3 5) (func7 0)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "tile_t_8 $zd, $zn")
+    (semantics "Read an eight-by-two tile as a two-by-eight: cols names the result's")
+    (formal (vtranspose vni32 8 zn))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 2.5) (expected-speedup 4.0)
+    (rationale "Non-square, so the row count and the column count cannot be confused"))
+
+  (definstruction tile_t_2
+    (mnemonic TILE_T_2) (isa za) (category simd) (format ZA_R)
+    (opcode 11) (func3 6) (func7 0)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "tile_t_2 $zd, $zn")
+    (semantics "Read it back the other way, which undoes the one above")
+    (formal (vtranspose vni32 2 zn))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 2.5) (expected-speedup 4.0)
+    (rationale "The inverse of a non-square transpose is the transpose of the other shape"))
+
+  (definstruction tile_rows
+    (mnemonic TILE_ROWS) (isa za) (category simd) (format ZA_R)
+    (opcode 11) (func3 3) (func7 0)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "tile_rows $zd, $zn")
+    (semantics "Broadcast each element across its row")
+    (formal (vrows vni32 4 zn))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 800.0) (power-estimate-mw 1.0) (expected-speedup 4.0)
+    (rationale "Half an outer product, described on its own so the gate can compare the halves"))
+
+  (definstruction tile_cols
+    (mnemonic TILE_COLS) (isa za) (category simd) (format ZA_R)
+    (opcode 11) (func3 4) (func7 0)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "tile_cols $zd, $zn")
+    (semantics "Broadcast each element down its column")
+    (formal (vcols vni32 4 zn))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 800.0) (power-estimate-mw 1.0) (expected-speedup 4.0)
+    (rationale "The other half, and the transpose of the first -- which is checked, not assumed"))
+)

@@ -1,0 +1,164 @@
+; An exposed-latency VLIW machine: no interlocks, and the schedule owns the gap
+; (docs/vliw_spatial_design.md §7, stage B3).
+;
+; VMUL takes three packets and VLDW two, so a read of either result in the
+; packets that follow gets the *old* value. That shadow is architectural state:
+; between issue and landing, a result lives in neither the register file nor
+; the instruction stream, so the state capsule carries it and its layout hash
+; differs from the same machine with interlocks.
+(axis-module xvliwx
+  (version "1.0")
+  (target rvmt)
+  (description "Exposed-latency four-slot VLIW packet")
+
+  (defisa lx32x
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defpacket lx128x
+    (isa lx32x)
+    (slots
+      (s0 (width 32) (units alu mem))
+      (s1 (width 32) (units alu))
+      (s2 (width 32) (units alu mul))
+      (s3 (width 32) (units br)))
+    (order little)
+    (end fixed)
+    (hazards exposed)
+    (branches at-most-one)
+    (description "Four syllables, no interlock: results land on a schedule"))
+
+  (definstruction xadd
+    (mnemonic XADD)
+    (isa lx32x)
+    (category custom)
+    (unit alu)
+    (format R)
+    (opcode 11)
+    (func3 0)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "xadd $rd, $rs1, $rs2")
+    (formal (add i32 rs1 rs2))
+    (latency 1)
+    (rationale "Visible to the next packet, so it needs no shadow at all"))
+
+  (definstruction xsub
+    (mnemonic XSUB)
+    (isa lx32x)
+    (category custom)
+    (unit alu)
+    (format R)
+    (opcode 11)
+    (func3 1)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "xsub $rd, $rs1, $rs2")
+    (formal (sub i32 rs1 rs2))
+    (latency 1)
+    (rationale "Visible to the next packet"))
+
+  (definstruction xmul
+    (mnemonic XMUL)
+    (isa lx32x)
+    (category custom)
+    (unit mul)
+    (format R)
+    (opcode 11)
+    (func3 3)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "xmul $rd, $rs1, $rs2")
+    (formal (mul i32 rs1 rs2))
+    (latency 3)
+    (rationale "Two packets of shadow: the multiplier is the deep pipe here"))
+
+  (definstruction xldw
+    (mnemonic XLDW)
+    (isa lx32x)
+    (category custom)
+    (unit mem)
+    (format I)
+    (opcode 11)
+    (func3 4)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (imm imm i12 in))
+    (asm "xldw $rd, $imm($rs1)")
+    (behavior
+      (set rd (load i32 signed (add rs1 imm))))
+    (latency 2)
+    (rationale "One packet of shadow, which is what a load costs"))
+
+  (definstruction xbrz
+    (mnemonic XBRZ)
+    (isa lx32x)
+    (category custom)
+    (unit br)
+    (format S)
+    (opcode 11)
+    (func3 5)
+    (func7 0)
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (imm imm i12 in))
+    (asm "xbrz $rs1, $imm, $rs2")
+    (behavior
+      (when (icmp_eq rs1 rs2) (setpc (add pc imm))))
+    (latency 1)
+    (rationale "Control transfers with the packet; delay slots are not B3"))
+
+  ; The two sides of one seam (P5 / G4b.3). `lane1` lends its multiplier to
+  ; `lane0` across a boundary, and each side states its own channel rather than
+  ; sharing one: the producer promises what it promises, the consumer states
+  ; what it can take, and whether those two compose is a question with an
+  ; answer instead of an assumption.
+  (defchannel mul-result-bus
+    (protocol ready-valid)
+    (latency 2 4)
+    (capacity 2)
+    (order preserving)
+    (description "What lane1's multiplier promises across the boundary"))
+
+  ; Wider on both ends than what arrives, which is what containment means: a
+  ; consumer that tolerates 1..6 tolerates every 2..4 producer, and would not
+  ; tolerate one that could be late by seven.
+  (defchannel mul-borrow-bus
+    (protocol ready-valid)
+    (latency 1 6)
+    (capacity 2)
+    (order preserving)
+    (description "What lane0 accepts when it borrows a multiplier"))
+
+  ; Two personalities over one ISA, so the shadow's checkpoint format is a
+  ; migration contract and not just a serialization.
+  (defpersonality lane0
+    (implements lx32x)
+    (discipline independent (threads 1))
+    (capsule "x[32]" pc)
+    (imports (mul-pipe (from lane1) (channel mul-borrow-bus)))
+    (description "Single-issue view of the exposed core"))
+
+  (defpersonality lane1
+    (implements lx32x)
+    (discipline lockstep (lanes 2))
+    (capsule "x[32]" pc)
+    (exports (mul-pipe (unit mul) (channel mul-result-bus)))
+    (description "Two-lane view sharing the checkpoint format"))
+)

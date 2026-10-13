@@ -1,0 +1,81 @@
+; An instruction whose semantics are not stated, performed by a routine the
+; embedder supplies (docs/generated_artifacts_plan.md).
+;
+; Some instructions have no semantics AXIS can state. What pointer
+; authentication computes depends on a key the machine holds and a QARMA
+; construction nothing here models; what a breakpoint does is a question about
+; the exception level, not about the register file. Those instructions still
+; decode and still assemble -- that is not negotiable -- but a description that
+; invented arithmetic for them would be stating something untrue.
+;
+; So they name a routine instead. It says WHAT TO CALL, not what is computed,
+; and that distinction decides who may use it: a consumer that runs code calls
+; it, and a consumer that reasons about code declines. The C executor and the
+; stencil JIT it feeds are the first kind; the golden model and SMT are the
+; second, because a reference that defers to an opaque routine has stopped
+; being a reference.
+(axis-module implementation_routine
+  (version "1.0")
+  (target rvmt)
+  (description "An instruction performed by a routine the embedder supplies")
+
+  (defisa impl_host
+    (role source)
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat IMPL_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  ; Stated semantics, for contrast: the gate drives this one too, so a routine
+  ; that never ran is distinguishable from a harness that never ran anything.
+  (definstruction add_plain
+    (mnemonic ADD_PLAIN) (isa impl_host) (category custom) (format IMPL_R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (rd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "add.plain $rd, $rs1, $rs2")
+    (semantics "Ordinary addition, stated")
+    (formal (add i64 rs1 rs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "The control: an instruction whose semantics AXIS does state"))
+
+  ; The third answer: nobody performs this here. Not a routine, because none is
+  ; supplied; not semantics, because none can be stated. An executor that meets
+  ; it traps, and the trap says `unimplemented` rather than one of the machine's
+  ; own causes -- because it is a fact about this build, not about the machine.
+  (definstruction sign_return
+    (mnemonic SIGN_RETURN) (isa impl_host) (category custom) (format IMPL_R)
+    (opcode 11) (func3 2) (func7 0)
+    (operands (rd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "sign.return $rd, $rs1, $rs2")
+    (semantics "Signs the return address; the key is not in this description")
+    (implementation unsupplied)
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "Decodes and assembles like any instruction; executing it here is an admission, not an answer"))
+
+  (definstruction auth_step
+    (mnemonic AUTH_STEP) (isa impl_host) (category custom) (format IMPL_R)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (rd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "auth.step $rd, $rs1, $rs2")
+    (semantics "Signs rs1 with the modifier in rs2 using a key the machine holds")
+    ; No `formal` and no `behavior`: the key is not in this description, and
+    ; inventing arithmetic for it would be stating something untrue.
+    (implementation axis_impl_auth_step)
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "The case the hook exists for: semantics that live outside the machine described here"))
+)

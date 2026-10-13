@@ -1,0 +1,128 @@
+; Block memory operations: loops over *effects*.
+;
+;   (iterate (<index> <count>) <statement> ...)
+;
+; The expression-level loop in src/loops.rs folds an accumulator into a value.
+; This is its statement-level counterpart: it repeats effects, which is what a
+; block copy or a block fill is -- one instruction performing a bounded number
+; of memory accesses. AArch64's MOPS copies and x86's REP MOVS are this shape,
+; and neither has any expression-level spelling at all.
+;
+; Two things this needed, and neither was a new mechanism.
+;
+; It expands before effect elaboration, because a statement loop changes how
+; many effects an instruction has and the effect list is built by the elaborator
+; it feeds. That is the same reason a vector *store* had to put its shape in the
+; address rather than in a value: locations are built by the elaborator, so
+; anything that shapes them has to arrive earlier.
+;
+; And it needs no multi-write ABI. EFFECT_MAX_WRITES bounds *register* writes,
+; while a copy's stores go to the memory image, so MEMSET32 below is 32 stores
+; and zero register writes -- comfortably inside an ABI that allows four.
+(axis-module blockmem
+  (version "0.1.0")
+  (target rvmt)
+  (description "Block copy and fill by statement-level loops")
+
+  (defisa blockmem
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat BLK_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (rs 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction memcpy16
+    (mnemonic MEMCPY16) (isa blockmem) (category custom) (format BLK_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 0) (func7 0)
+    (operands (rd reg i64 in) (rs reg i64 in))
+    (asm "memcpy16 $rd, $rs")
+    (semantics "Copy 16 bytes: one instruction, sixteen loads and sixteen stores")
+    (behavior
+      (iterate (i 16)
+        (store (add i64 rd i) (load i8 unsigned (add i64 rs i)) i8)))
+    (latency 16) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.5) (expected-speedup 1.0)
+    (rationale "Copy 16 bytes: one instruction, sixteen loads and sixteen stores"))
+
+  (definstruction memcpy8_w
+    (mnemonic MEMCPY8_W) (isa blockmem) (category custom) (format BLK_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 1) (func7 1)
+    (operands (rd reg i64 in) (rs reg i64 in))
+    (asm "memcpy8_w $rd, $rs")
+    (semantics "Copy 8 words: the index scales the offset, so the stride is part of the loop")
+    (behavior
+      (iterate (i 8)
+        (store (add i64 rd (mul i64 i 4)) (load i32 unsigned (add i64 rs (mul i64 i 4))) i32)))
+    (latency 8) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.5) (expected-speedup 1.0)
+    (rationale "Copy 8 words: the index scales the offset, so the stride is part of the loop"))
+
+  (definstruction memset32
+    (mnemonic MEMSET32) (isa blockmem) (category custom) (format BLK_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 2) (func7 2)
+    (operands (rd reg i64 in) (rs reg i64 in))
+    (asm "memset32 $rd, $rs")
+    (semantics "Fill 32 bytes with the low byte of a register")
+    (behavior
+      (iterate (i 32)
+        (store (add i64 rd i) rs i8)))
+    (latency 32) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.5) (expected-speedup 1.0)
+    (rationale "Fill 32 bytes with the low byte of a register"))
+
+  (definstruction memcpy_rev8
+    (mnemonic MEMCPY_REV8) (isa blockmem) (category custom) (format BLK_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 3) (func7 3)
+    (operands (rd reg i64 in) (rs reg i64 in))
+    (asm "memcpy_rev8 $rd, $rs")
+    (semantics "Copy 8 bytes reversed: the index appears on both sides with different arithmetic")
+    (behavior
+      (iterate (i 8)
+        (store (add i64 rd i) (load i8 unsigned (add i64 rs (sub i64 7 i))) i8)))
+    (latency 8) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.5) (expected-speedup 1.0)
+    (rationale "Copy 8 bytes reversed: the index appears on both sides with different arithmetic"))
+
+  ; --- a 32-bit copy, so the compact executor sees this shape too ---------
+  ;
+  ; Everything above takes 64-bit pointers, which the compact 32-bit executor
+  ; skips -- so the compact emitters were never asked to lower a store whose
+  ; value is a load, and had the same gap the wide ones did with nothing to
+  ; reveal it. This one is narrow enough for that path to reach.
+  (defisa blockmem32
+    (base rv32i)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (definstruction memcpy4_w
+    (mnemonic MEMCPY4_W) (isa blockmem32) (category custom) (format BLK_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 5) (func7 5)
+    (operands (rd reg i32 in) (rs reg i32 in))
+    (asm "memcpy4_w $rd, $rs")
+    (semantics "Copy four bytes with 32-bit pointers")
+    (behavior
+      (iterate (i 4)
+        (store (add i32 rd i) (load i8 unsigned (add i32 rs i)) i8)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 700.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Narrow enough for the compact executor, so the compact store-of-load lowering has a gate"))
+)

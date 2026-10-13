@@ -1,0 +1,140 @@
+; `ones` and `zeros`: a mask named rather than spelled out.
+;
+; Every mask in this project used to be a hex literal. That is fine when the
+; width is known when the description is written -- `0xffffffff00000000` is a
+; NaN-box and nothing else -- and impossible when it is not: a mask of `vl` low
+; bits, where `vl` is a register, cannot be a literal at all. `ones` takes the
+; count as an ordinary expression, which is the whole reason it is an operator.
+;
+; The count may exceed the width, and it says so: a mask asked for more bits
+; than the value holds gets all of them. That has to be stated by every backend
+; rather than inherited, because `1 << n` means four different things -- zero in
+; SMT-LIB, poison in LLVM, undefined in C, an unbounded integer in Python. The
+; instructions below drive the count from a register precisely so the gates
+; reach the cases a literal never would.
+;
+; `zeros` is zero whatever its count. It is here because a cleared mask reads as
+; one at a use site, beside the `ones` it complements, where a bare `0` leaves
+; the reader to work out what shape was intended.
+(axis-module masks
+  (version "1.0.0")
+  (target rvmt)
+  (description "Bit masks with a computed width")
+
+  (defisa maskisa
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64")
+    (memory-model rvwmo)
+    (endianness little))
+
+  (definstruction mask_low
+    (mnemonic MASK_LOW)
+    (isa maskisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 0)
+    (func7 0) (encoding (rs2 0))
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in))
+    (asm "mask.low $rd, $rs1")
+    (semantics "A mask of rs1 low bits, saturating at the width")
+    (formal (ones i64 rs1))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    ; The prose here is load-bearing: `emit-python` renders the JSON manifest as
+    ; Python, and the three words below are the three JSON literals. Rewriting
+    ; them with a string replace rewrote them inside string values too, so this
+    ; rationale came out claiming something is "True" for a "None" count. It is
+    ; a witness, not a sentence anyone needed.
+    (rationale "The witness for a count from a register; true of a null count, false otherwise"))
+
+  (definstruction mask_keep
+    (mnemonic MASK_KEEP)
+    (isa maskisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 1)
+    (func7 0)
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in)
+      (rs2 reg i64 in))
+    (asm "mask.keep $rd, $rs1, $rs2")
+    (semantics "Keep the low rs2 bits of rs1")
+    (formal (and i64 rs1 (ones i64 rs2)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "A mask used as a mask, which is what it is for"))
+
+  (definstruction mask_high
+    (mnemonic MASK_HIGH)
+    (isa maskisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 2)
+    (func7 0) (encoding (rs2 0))
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in))
+    (asm "mask.high $rd, $rs1")
+    (semantics "The complement: everything above the low rs1 bits")
+    (formal (not i64 (ones i64 rs1)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "How a NaN-box is written once the mask has a name"))
+
+  (definstruction mask_all
+    (mnemonic MASK_ALL)
+    (isa maskisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 3)
+    (func7 0) (encoding (rs2 0))
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in))
+    (asm "mask.all $rd, $rs1")
+    (semantics "Every bit, and none, at the evaluation width")
+    (formal (xor i64 (ones i64) (zeros i64 rs1)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "The countless form, and zeros beside it"))
+
+  (definstruction mask_narrow
+    (mnemonic MASK_NARROW)
+    (isa maskisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 4)
+    (func7 0) (encoding (rs2 0))
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in))
+    (asm "mask.narrow $rd, $rs1")
+    (semantics "A mask built at 32 bits and widened, not built at 64")
+    (formal (zext i64 32 (ones i32 rs1)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "The saturating rule is per evaluation width, not per machine")))

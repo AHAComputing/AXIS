@@ -1,0 +1,111 @@
+; The completion contract (docs/tensor_design.md, T9).
+;
+; An accelerator manifest said how a descriptor is shaped, how a launch is
+; made, and what field a completion is written to. It did not say WHEN the
+; engine's writes become visible, what the host may read before then, or
+; whether the launch orders the host's prior stores against the engine's reads.
+; Those are the three questions a runtime must answer to write correct code
+; against an engine that outlives its launch, and none of them were anywhere.
+;
+;   (visibility immediate | atomic-at-completion | progressive)
+;   (launch-fence prior-stores | none)
+;   (in-flight unchanged | undefined)
+;
+; ⚠️ Each is checked against something the description already said, because a
+; declaration nothing checks is a comment. `coupling` and `visibility` are the
+; same fact stated twice: a tightly coupled engine finishes inside the
+; launching instruction, so it has nothing to poll and no in-flight window; a
+; queue-descriptor one outlives its launch, so it must say how the host learns
+; it is done. A description that states them differently was accepted in
+; silence before this.
+;
+; ⚠️ What is NOT checked is the timing itself, and the reason is written down
+; rather than left to be discovered. An accelerator is a pure function of its
+; ports in every backend -- there is no execution model with a mid-flight
+; moment in it -- so an interleaving gate needs one built first. That is a
+; larger thing than a declaration and has nothing waiting on it, where the
+; declaration has a consumer today.
+(axis-module completion
+  (version "0.1.0")
+  (target rvmt)
+  (description "When an engine's writes land, and what the host sees before then")
+
+  (defisa host
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat H_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction submit
+    (mnemonic SUBMIT) (isa host) (category custom) (format H_R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (rd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "submit $rd, $rs1, $rs2")
+    (semantics "Enqueue a descriptor and return the queue slot")
+    (formal (add i64 rs1 rs2))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.6) (expected-speedup 1.0)
+    (rationale "The launch itself: everything interesting happens after it retires"))
+
+  ; An engine that outlives its launch and commits whole. The host polls the
+  ; completion field; until it fires the output region reads as it did before,
+  ; which is what lets a runtime double-buffer against it.
+  (defaccelerator npu_atomic
+    (family nearasic) (subtype matmul)
+    (descriptor-version 1) (descriptor-schema rvmt_nearasic_v1) (descriptor-bytes 68)
+    (launch-abi rvmt_submit_entry) (completion status_addr)
+    (target nearasic) (coupling queue_descriptor)
+    (visibility atomic-at-completion)
+    (launch-fence prior-stores)
+    (in-flight unchanged)
+    (element-width-bits 32)
+    (ports (a input bits i32) (b input bits i32) (y output bits i32))
+    (semantics "Multiply two words")
+    (formal (mul i32 a b))
+    (latency 100) (throughput 0.1))
+
+  ; The same shape of engine that writes as it goes. It must say what a host
+  ; reading the region mid-flight sees, and `undefined` is a real answer --
+  ; M1's definedness one level up, applied to a region rather than to lanes.
+  (defaccelerator npu_progressive
+    (family nearasic) (subtype reduce)
+    (descriptor-version 1) (descriptor-schema rvmt_nearasic_v1) (descriptor-bytes 68)
+    (launch-abi rvmt_submit_entry) (completion status_addr)
+    (target nearasic) (coupling stream)
+    (visibility progressive)
+    (launch-fence none)
+    (in-flight undefined)
+    (element-width-bits 32)
+    (ports (a input bits i32) (b input bits i32) (y output bits i32))
+    (semantics "Add two words")
+    (formal (add i32 a b))
+    (latency 40) (throughput 0.5))
+
+  ; And one that finishes inside the instruction that launched it. It has no
+  ; completion field, because there is nothing to poll, and no in-flight
+  ; window, because there is no flight.
+  (defaccelerator alu_immediate
+    (family nearasic) (subtype fused)
+    (descriptor-version 1) (descriptor-schema rvmt_nearasic_v1) (descriptor-bytes 0)
+    (launch-abi rvmt_submit_entry)
+    (target nearasic) (coupling tightly_coupled)
+    (visibility immediate)
+    (launch-fence none)
+    (element-width-bits 32)
+    (ports (a input bits i32) (b input bits i32) (y output bits i32))
+    (semantics "Subtract two words")
+    (formal (sub i32 a b))
+    (latency 2) (throughput 1.0))
+)

@@ -1,0 +1,326 @@
+; Scalable vector memory, stage S5 (docs/scalable_vectors_design.md, M4).
+;
+; A scalable load touches VL/elem elements, so the number of accesses is not
+; known when the instruction is written. `(vload <type> base)` says lane l reads
+; `base + l*bytes` and `(vload_strided <type> base step)` says it reads
+; `base + l*step`. The address *function* is the only difference between them,
+; which is mechanism M4's point: gather is a third function, not a third
+; mechanism.
+;
+; This is the first scalable stage in the effect layer rather than in pure
+; semantics, and it is what closes the limit stage S1 recorded. A pure lane
+; function is a function of its parameters, so `(add i32 zn__l0 zm__l0)` and
+; `(add i32 zn__l1 zm__l1)` are the same function and no differential gate can
+; tell lane 0 from lane 1. An address cannot hide that way: `base + l*bytes`
+; names the lane, so a wrong lane-to-address mapping is finally something a gate
+; can see -- and tools/scalable_addressing.py is the independent reference that
+; sees it.
+;
+; One instruction still becomes one lane instruction each, so a vector load is N
+; single-write effects rather than one N-write effect. That keeps
+; EFFECT_MAX_WRITES out of it entirely: the ABI never sees a vector.
+(axis-module scalable_memory
+  (version "0.1.0")
+  (target rvmt)
+  (description "Unit-stride and strided scalable vector loads")
+
+  (defisa sve_mem
+    (base rv64im)
+    (word-bits 64)
+    (vector-bits 128)
+    (registers "z[32]:i64" "pc:i64" "mem_lo:i64" "mem_hi:i64")
+    (features simd scalable memory custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat SVE_M
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  ; A store's SOURCE sits where a load's destination does. The bits are the
+  ; same; an operand binds to the field whose name it matches, so `zs` bound to
+  ; nothing and five stores could not be encoded. This is SVE_M under the name
+  ; the instruction uses.
+  (defformat SVE_MS
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zs 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  ; A segment load writes two, three or four CONSECUTIVE registers, and the
+  ; instruction word names only the first -- which is what its assembly prints.
+  ; The rest are derived from it, the same way `CASP` names a register pair with
+  ; one field. Inventing four destination fields would not fit anyway: four
+  ; registers, a base, an opcode and a sub-opcode want 35 bits of 32.
+  (defformat SVE_MSEG
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd0 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction vld_b
+    (mnemonic VLD_B) (isa sve_mem) (category custom) (format SVE_M)
+    (opcode 7) (func3 0) (func7 0)
+    (encoding (rs2 0))
+    (operands (zd reg i8 out) (rs1 reg i64 in))
+    (asm "vld_b $zd, ($rs1)")
+    (semantics "Unit-stride load of 8-bit elements")
+    (behavior (set zd (vload vni8 rs1)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride load of 8-bit elements"))
+
+  (definstruction vld_h
+    (mnemonic VLD_H) (isa sve_mem) (category custom) (format SVE_M)
+    (opcode 7) (func3 1) (func7 1)
+    (encoding (rs2 0))
+    (operands (zd reg i16 out) (rs1 reg i64 in))
+    (asm "vld_h $zd, ($rs1)")
+    (semantics "Unit-stride load of 16-bit elements")
+    (behavior (set zd (vload vni16 rs1)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride load of 16-bit elements"))
+
+  (definstruction vld_s
+    (mnemonic VLD_S) (isa sve_mem) (category custom) (format SVE_M)
+    (opcode 7) (func3 2) (func7 2)
+    (encoding (rs2 0))
+    (operands (zd reg i32 out) (rs1 reg i64 in))
+    (asm "vld_s $zd, ($rs1)")
+    (semantics "Unit-stride load of 32-bit elements")
+    (behavior (set zd (vload vni32 rs1)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride load of 32-bit elements"))
+
+  (definstruction vld_d
+    (mnemonic VLD_D) (isa sve_mem) (category custom) (format SVE_M)
+    (opcode 7) (func3 3) (func7 3)
+    (encoding (rs2 0))
+    (operands (zd reg i64 out) (rs1 reg i64 in))
+    (asm "vld_d $zd, ($rs1)")
+    (semantics "Unit-stride load of 64-bit elements")
+    (behavior (set zd (vload vni64 rs1)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride load of 64-bit elements"))
+
+  (definstruction vlds_s
+    (mnemonic VLDS_S) (isa sve_mem) (category custom) (format SVE_M)
+    (opcode 7) (func3 4) (func7 4)
+    (operands (zd reg i32 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "vlds_s $zd, ($rs1), $rs2")
+    (semantics "Strided load of 32-bit elements")
+    (behavior (set zd (vload_strided vni32 rs1 rs2)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Strided load of 32-bit elements"))
+
+  (definstruction vlds_h
+    (mnemonic VLDS_H) (isa sve_mem) (category custom) (format SVE_M)
+    (opcode 7) (func3 5) (func7 5)
+    (operands (zd reg i16 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "vlds_h $zd, ($rs1), $rs2")
+    (semantics "Strided load of 16-bit elements")
+    (behavior (set zd (vload_strided vni16 rs1 rs2)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Strided load of 16-bit elements"))
+
+  ; --- vector stores ------------------------------------------------------
+  ;
+  ; A store's vector-ness lives in the *address* rather than in a value, and
+  ; that is forced rather than chosen. `(store addr value width)` becomes a
+  ; `Loc::Mem` built by the effect elaborator, so a `vstore` written as a value
+  ; would never become a memory location at all -- it would have to be expanded
+  ; before elaboration, splitting the mechanism across two frontends. `vaddr` is
+  ; an ordinary expression, so the same lane rewrite that reaches a load's
+  ; address reaches this one.
+  ;
+  ; The per-lane store width is written out so the document reads honestly.
+  ; Disagreeing with the shape the address describes is an error, not a silent
+  ; correction.
+
+  (definstruction vst_b
+    (mnemonic VST_B) (isa sve_mem) (category custom) (format SVE_MS)
+    (opcode 39) (func3 0) (func7 8)
+    (encoding (rs2 0))
+    (operands (zs reg i8 in) (rs1 reg i64 in))
+    (asm "vst_b $zs, ($rs1)")
+    (semantics "Unit-stride store of 8-bit elements")
+    (behavior (store (vaddr vni8 rs1) zs i8))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride store of 8-bit elements"))
+
+  (definstruction vst_h
+    (mnemonic VST_H) (isa sve_mem) (category custom) (format SVE_MS)
+    (opcode 39) (func3 1) (func7 9)
+    (encoding (rs2 0))
+    (operands (zs reg i16 in) (rs1 reg i64 in))
+    (asm "vst_h $zs, ($rs1)")
+    (semantics "Unit-stride store of 16-bit elements")
+    (behavior (store (vaddr vni16 rs1) zs i16))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride store of 16-bit elements"))
+
+  (definstruction vst_s
+    (mnemonic VST_S) (isa sve_mem) (category custom) (format SVE_MS)
+    (opcode 39) (func3 2) (func7 10)
+    (encoding (rs2 0))
+    (operands (zs reg i32 in) (rs1 reg i64 in))
+    (asm "vst_s $zs, ($rs1)")
+    (semantics "Unit-stride store of 32-bit elements")
+    (behavior (store (vaddr vni32 rs1) zs i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride store of 32-bit elements"))
+
+  (definstruction vst_d
+    (mnemonic VST_D) (isa sve_mem) (category custom) (format SVE_MS)
+    (opcode 39) (func3 3) (func7 11)
+    (encoding (rs2 0))
+    (operands (zs reg i64 in) (rs1 reg i64 in))
+    (asm "vst_d $zs, ($rs1)")
+    (semantics "Unit-stride store of 64-bit elements")
+    (behavior (store (vaddr vni64 rs1) zs i64))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride store of 64-bit elements"))
+
+  (definstruction vsts_s
+    (mnemonic VSTS_S) (isa sve_mem) (category custom) (format SVE_MS)
+    (opcode 39) (func3 4) (func7 12)
+    (operands (zs reg i32 in) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "vsts_s $zs, ($rs1), $rs2")
+    (semantics "Strided store of 32-bit elements")
+    (behavior (store (vaddr_strided vni32 rs1 rs2) zs i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Strided store of 32-bit elements"))
+
+  ; --- fault-suppressing loads (M5) --------------------------------------
+  ;
+  ; A predicated load must not fault on lanes it does not perform, and that is
+  ; the one thing the `vmerge`-as-select design cannot express: a select
+  ; computes every lane and discards some, and computing a lane is exactly what
+  ; faults. So the condition has to reach the access itself, which is why it
+  ; lives on the effect's guard rather than wrapping its value.
+  ;
+  ; The accessible region is architectural state the ISA declares, and the
+  ; instruction names the two bounds rather than depending on magic register
+  ; names. This models one contiguous region, not a page table -- enough to pin
+  ; lane-stopping behaviour, which is the architectural content of first-fault,
+  ; and not enough to model address translation, which is not.
+
+  (definstruction vldnf_s
+    (mnemonic VLDNF_S) (isa sve_mem) (category custom) (format SVE_M)
+    (opcode 7) (func3 5) (func7 13)
+    (encoding (rs2 0))
+    (operands (zd reg i32 out) (rs1 reg i64 in))
+    (asm "vldnf_s $zd, ($rs1)")
+    (semantics "Non-faulting load: each lane outside the accessible region is simply not performed")
+    (behavior (set zd (vload_nf vni32 rs1 mem_lo mem_hi)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Non-faulting load: each lane outside the accessible region is simply not performed"))
+
+  (definstruction vldff_s
+    (mnemonic VLDFF_S) (isa sve_mem) (category custom) (format SVE_M)
+    (opcode 7) (func3 6) (func7 14)
+    (encoding (rs2 0))
+    (operands (zd reg i32 out) (rs1 reg i64 in))
+    (asm "vldff_s $zd, ($rs1)")
+    (semantics "First-faulting load: stops at the first lane that would leave the accessible region")
+    (behavior (set zd (vload_ff vni32 rs1 mem_lo mem_hi)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "First-faulting load: stops at the first lane that would leave the accessible region"))
+
+  (definstruction vldnf_h
+    (mnemonic VLDNF_H) (isa sve_mem) (category custom) (format SVE_M)
+    (opcode 7) (func3 7) (func7 15)
+    (encoding (rs2 0))
+    (operands (zd reg i32 out) (rs1 reg i64 in))
+    (asm "vldnf_h $zd, ($rs1)")
+    (semantics "Non-faulting load of 16-bit elements")
+    (behavior (set zd (vload_nf vni16 rs1 mem_lo mem_hi)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Non-faulting load of 16-bit elements"))
+
+  ; --- segment loads ------------------------------------------------------
+  ;
+  ; A segment load reads interleaved structures: field f of element l sits at
+  ; base + (l*nf + f)*bytes. That is a third address function, which is M4's
+  ; claim -- gather, stride and interleave are all the same mechanism with a
+  ; different offset.
+  ;
+  ; Each field is its own destination, so each is its own effect. Because
+  ; instantiation already splits by lane, a lane instruction holds nf
+  ; single-lane writes rather than one wide one, which keeps SVE's LD2/LD3/LD4
+  ; inside EFFECT_MAX_WRITES without raising it. The design expected to bump
+  ; that constant from 4 to 8; lane-indexing means SVE does not need it, and
+  ; only RVV's nf up to 8 would.
+
+  (definstruction vld2_s
+    (mnemonic VLD2_S) (isa sve_mem) (category custom) (format SVE_MSEG)
+    (opcode 7) (func3 0) (func7 16)
+    (encoding (rs2 0))
+    (operands (zd0 reg i32 out) (zd1 reg i32 out (derive zd0 1)) (rs1 reg i64 in))
+    (asm "vld2_s $zd0, ($rs1)")
+    (semantics "Load 2-field interleaved structures; field f of element l is at base + (l*2 + f)*4")
+    (behavior
+      (set zd0 (vload_seg vni32 2 0 rs1))
+      (set zd1 (vload_seg vni32 2 1 rs1)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 2500.0) (power-estimate-mw 4.0) (expected-speedup 2.0)
+    (rationale "Load 2-field interleaved structures; field f of element l is at base + (l*2 + f)*4"))
+
+  (definstruction vld3_s
+    (mnemonic VLD3_S) (isa sve_mem) (category custom) (format SVE_MSEG)
+    (opcode 7) (func3 1) (func7 17)
+    (encoding (rs2 0))
+    (operands (zd0 reg i32 out) (zd1 reg i32 out (derive zd0 1)) (zd2 reg i32 out (derive zd0 2)) (rs1 reg i64 in))
+    (asm "vld3_s $zd0, ($rs1)")
+    (semantics "Load 3-field interleaved structures; field f of element l is at base + (l*3 + f)*4")
+    (behavior
+      (set zd0 (vload_seg vni32 3 0 rs1))
+      (set zd1 (vload_seg vni32 3 1 rs1))
+      (set zd2 (vload_seg vni32 3 2 rs1)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 2500.0) (power-estimate-mw 4.0) (expected-speedup 2.0)
+    (rationale "Load 3-field interleaved structures; field f of element l is at base + (l*3 + f)*4"))
+
+  (definstruction vld4_s
+    (mnemonic VLD4_S) (isa sve_mem) (category custom) (format SVE_MSEG)
+    (opcode 7) (func3 2) (func7 18)
+    (encoding (rs2 0))
+    (operands (zd0 reg i32 out) (zd1 reg i32 out (derive zd0 1)) (zd2 reg i32 out (derive zd0 2)) (zd3 reg i32 out (derive zd0 3)) (rs1 reg i64 in))
+    (asm "vld4_s $zd0, ($rs1)")
+    (semantics "Load 4-field interleaved structures; field f of element l is at base + (l*4 + f)*4")
+    (behavior
+      (set zd0 (vload_seg vni32 4 0 rs1))
+      (set zd1 (vload_seg vni32 4 1 rs1))
+      (set zd2 (vload_seg vni32 4 2 rs1))
+      (set zd3 (vload_seg vni32 4 3 rs1)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 2500.0) (power-estimate-mw 4.0) (expected-speedup 2.0)
+    (rationale "Load 4-field interleaved structures; field f of element l is at base + (l*4 + f)*4"))
+)

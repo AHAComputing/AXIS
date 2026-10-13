@@ -1,0 +1,88 @@
+; H1b: a descriptor, declared (docs/accelerator_design.md).
+;
+; `defdescriptor` says what a launch descriptor IS -- the thing AHA's loader
+; knew only as a schema name and a byte count: where each field sits, the
+; checks an engine applies before it does anything, the status each failure
+; writes, and where the status goes. `(launches <descriptor> <base> <kernel>
+; <argument>...)` binds a kernel's params to fields of the descriptor at the
+; address in <base>, and the instruction's behavior is DERIVED: the kernel,
+; every statement guarded by every check, then one status write -- the first
+; failing check's code, or 0.
+;
+; The layout is AHA's Bio queue ABI (pce aha/verticals/bio/queue_abi.py:
+; BIO_DESC_FIELDS, 17 u32 words, 68 bytes, magic 0x42494F31, ABI version 1).
+; H1a wrote one launch over it by hand; this declares it once and launches two
+; kernels through it, which bind different fields to their params.
+(axis-module descriptor
+  (version "0.1.0")
+  (target rvmt)
+  (description "Bio's queue descriptor, declared, and two kernels launched through it")
+
+  (defisa rvbio
+    (base rv64im) (word-bits 64) (registers "x[32]:i64" "pc:i64")
+    (features custom) (memory-model rvwmo) (endianness little))
+
+  (defformat R
+    (bits 32)
+    (fields (opcode 6 0) (rd 11 7) (func3 14 12) (rs1 19 15) (rs2 24 20) (func7 31 25)))
+
+  (defdescriptor bio_v1
+    (bytes 68)
+    (fields
+      (magic 0 i32) (abi_version 4 i32) (op 8 i32) (flags 12 i32)
+      (input_ptr 16 i32) (input_bytes 20 i32) (output_ptr 24 i32) (output_bytes 28 i32)
+      (scratch_ptr 32 i32) (scratch_bytes 36 i32)
+      (param0 40 i32) (param1 44 i32) (param2 48 i32) (param3 52 i32)
+      (job_id 56 i32) (reserved 60 i32) (status_ptr 64 i32))
+    (check (eq magic 1112100657) 1)
+    (check (eq abi_version 1) 2)
+    (check (ult param0 9) 3)
+    (status status_ptr i32)
+    (description "AHA Bio queue ABI v1: 17 u32 words; status 0 ok, 1 magic, 2 version, 3 count"))
+
+  ; Elementwise over a count the descriptor holds, bounded by what the engine
+  ; can hold: the space is the capacity, the guard is the request.
+  (defkernel double_words
+    (params out in count)
+    (space (i 8))
+    (when (ult i count)
+      (store (add i64 out (mul i64 i 4))
+             (mul i32 (load i32 unsigned (add i64 in (mul i64 i 4))) 2)
+             i32))
+    (description "out[i] = 2 * in[i] for i < count"))
+
+  (defkernel add_words
+    (params out a b count)
+    (space (i 8))
+    (when (ult i count)
+      (store (add i64 out (mul i64 i 4))
+             (add i32 (load i32 unsigned (add i64 a (mul i64 i 4)))
+                      (load i32 unsigned (add i64 b (mul i64 i 4))))
+             i32))
+    (description "out[i] = a[i] + b[i] for i < count"))
+
+  (definstruction bio_double
+    (mnemonic BIO_DOUBLE) (isa rvbio) (category custom) (format R)
+    (opcode 11) (func3 0) (func7 0)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 reg i64 in))
+    (asm "bio_double ($rs1)")
+    (semantics "Double param0 words from input_ptr into output_ptr, through the Bio descriptor at rs1")
+    (launches bio_v1 rs1 double_words output_ptr input_ptr param0)
+    (latency 100) (throughput 0.01)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A launch is a descriptor and a kernel; the effects follow"))
+
+  ; The second input rides in the scratch region: a different kernel binds
+  ; different fields of the same descriptor, and the checks come with it.
+  (definstruction bio_add
+    (mnemonic BIO_ADD) (isa rvbio) (category custom) (format R)
+    (opcode 11) (func3 1) (func7 0)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 reg i64 in))
+    (asm "bio_add ($rs1)")
+    (semantics "Add param0 words of input_ptr and scratch_ptr into output_ptr")
+    (launches bio_v1 rs1 add_words output_ptr input_ptr scratch_ptr param0)
+    (latency 100) (throughput 0.01)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "One descriptor, two engines' worth of binding")))

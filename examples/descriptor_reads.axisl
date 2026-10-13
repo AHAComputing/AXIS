@@ -1,0 +1,74 @@
+; H1a: an effect may read memory in its ADDRESS and in its GUARD, not only in
+; its value (docs/accelerator_design.md).
+;
+; A descriptor launch is the reason. BIO_LAUNCH is AHA's Bio queue ABI in
+; miniature (pce aha/verticals/bio/queue_abi.py: a 68-byte descriptor,
+; magic 0x42494F31 at 0, ABI version at 4, input_ptr at 16, output_ptr at 24,
+; param0 at 40, status_ptr at 64). The engine checks the magic, the version
+; and the count it was given, doubles `param0` words from `input_ptr` into
+; `output_ptr`, and writes a status code to `status_ptr`: 0 on success, 1 for
+; a bad magic, 2 for a bad version, 3 for a count past what it holds. If bit
+; 0 of `flags` (offset 12) is set it also copies `job_id` (offset 56) to the
+; word after the status, so a host polling many jobs knows which finished.
+;
+; Every one of those is a read somewhere an effect could not read before:
+;   - the guard checks the magic and bounds the loop by a count in memory;
+;   - every store goes to an address that was itself read from memory.
+; Written by hand here; H1b is the form that derives it from a declared layout.
+;
+; Every load an effect names is PERFORMED, once each, innermost first and left
+; to right, whatever the guard's `and` or a `select` later decides. The C
+; simulator short-circuited the magic check and read one word where the Python
+; executor read three -- both answers right, two different traces -- and the
+; wide executors now hoist an effect's loads to make the order the rule.
+(axis-module descriptor_reads
+  (version "0.1.0")
+  (target rvmt)
+  (description "A descriptor launch: stores to addresses read from memory, guards that read it")
+
+  (defisa rvdesc
+    (base rv64im) (word-bits 64) (registers "x[32]:i64" "pc:i64")
+    (features custom) (memory-model rvwmo) (endianness little))
+
+  (defformat R
+    (bits 32)
+    (fields (opcode 6 0) (rd 11 7) (func3 14 12) (rs1 19 15) (rs2 24 20) (func7 31 25)))
+
+  (definstruction bio_launch
+    (mnemonic BIO_LAUNCH) (isa rvdesc) (category custom) (format R)
+    (opcode 11) (func3 0) (func7 0)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 reg i64 in))
+    (asm "bio_launch ($rs1)")
+    (semantics "Validate the descriptor at rs1, double param0 words from input_ptr to output_ptr, write status")
+    (behavior
+      (iterate (i 8)
+        (when (and (eq (load i32 unsigned rs1) 1112100657)
+                   (eq (load i32 unsigned (add i64 rs1 4)) 1)
+                   (ult (load i32 unsigned (add i64 rs1 40)) 9)
+                   (ult i (load i32 unsigned (add i64 rs1 40))))
+          (store (add i64 (zext i64 32 (load i32 unsigned (add i64 rs1 24))) (mul i64 i 4))
+                 (mul i32 (load i32 unsigned
+                            (add i64 (zext i64 32 (load i32 unsigned (add i64 rs1 16))) (mul i64 i 4)))
+                          2)
+                 i32)))
+      (store (zext i64 32 (load i32 unsigned (add i64 rs1 64)))
+             (select i32 (icmp_eq (load i32 unsigned rs1) 1112100657)
+               (select i32 (icmp_eq (load i32 unsigned (add i64 rs1 4)) 1)
+                 (select i32 (icmp_ult (load i32 unsigned (add i64 rs1 40)) 9) 0 3)
+                 2)
+               1)
+             i32)
+      ; ⚠️ A NARROW guard, and the reason it is here is an injection that
+      ; passed. Every guard above compares at 64 bits, so evaluating a guard's
+      ; loads at the guard's width changed nothing and the gate said PASS with
+      ; the width removed. A flag test compares a byte: this guard is an i8
+      ; comparison whose load reads a 64-bit address, which is exactly what
+      ; `guard_load_address_width` exists to keep apart.
+      (when (eq (and i8 (load i8 unsigned (add i64 rs1 12)) 1) 1)
+        (store (add i64 (zext i64 32 (load i32 unsigned (add i64 rs1 64))) 4)
+               (load i32 unsigned (add i64 rs1 56))
+               i32)))
+    (latency 100) (throughput 0.01)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "The whole engine is reads the old effect surface refused: a checked field, a counted loop, a pointer")))

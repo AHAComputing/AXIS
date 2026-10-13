@@ -1,0 +1,98 @@
+; Lisp-native effects and operand-dependent decode legality.
+(axis-module lisp-behaviors
+  (version "0.2.0")
+  (target generic)
+  (description "Ordered architectural behavior expressed entirely as Lisp")
+
+  (defisa axis32
+    (base rv32i)
+    (word-bits 32)
+    (registers "x[32]:i32" "flags:i4")
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defsem effective-address
+    ((base i32) (offset i32))
+    i32
+    (let ((scaled (shl i32 offset 2)))
+      (add i32 base scaled)))
+
+  (definstruction LOAD-SCALED
+    (isa axis32)
+    (format I)
+    (opcode 0x0b)
+    (func3 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (imm imm i32 in))
+    (behavior
+      (set rd (load i32 unsigned (effective-address rs1 imm)))))
+
+  (definstruction STORE-WORD
+    (isa axis32)
+    (format S)
+    (opcode 0x0b)
+    (func3 1)
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (imm imm i32 in))
+    (behavior
+      (store (add i32 rs1 imm) rs2 i32)))
+
+  (definstruction BRANCH-EQUAL
+    (isa axis32)
+    (format B)
+    (opcode 0x0b)
+    (func3 2)
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (imm imm i32 in))
+    (behavior
+      (when (eq rs1 rs2)
+        (setpc (add i32 pc imm)))))
+
+  (definstruction TRAP-EQUAL
+    (isa axis32)
+    (format R)
+    (opcode 0x0b)
+    (func3 3)
+    (func7 0)
+    (encoding (rd 0))
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (behavior
+      (when (eq rs1 rs2)
+        (trap illegal))))
+
+  (definstruction ADD-AND-FLAGS
+    (isa axis32)
+    (format R)
+    (opcode 0x0b)
+    (func3 4)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (behavior
+      (set rd (add i32 rs1 rs2))
+      (setstate flags (and i32 rs1 15) i4)))
+
+  ; Lisp requirements normalize to the same typed legality constraint used by
+  ; legacy modules, so every encoder and lifter enforces it.
+  (definstruction CONSTRAINED-EXTEND
+    (isa axis32)
+    (format R)
+    (opcode 0x0b)
+    (func3 5)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 imm i32 in))
+    (requires (a64-extended-reg rs2))
+    (formal (add i32 rs1 rs2))))

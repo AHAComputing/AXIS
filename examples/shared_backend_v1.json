@@ -1,0 +1,26 @@
+{
+  "schema": "axis.shared-backend.v1",
+  "config": {
+    "contexts": 2,
+    "units_total": 2,
+    "request_ports_total": 2,
+    "result_ports_total": 2,
+    "queue_depth_per_pool": 8,
+    "shared": true,
+    "input_delay": 1,
+    "output_delay": 1,
+    "pipelined": false
+  },
+  "streams": [
+    [
+      {"name": "a0", "latency": 3},
+      {"name": "a1", "latency": 3},
+      {"name": "a2", "latency": 3, "deps": ["a0"]},
+      {"name": "a3", "latency": 3, "deps": ["a1"]}
+    ],
+    [
+      {"name": "b0", "latency": 3},
+      {"name": "b1", "latency": 3, "deps": ["b0"]}
+    ]
+  ]
+}

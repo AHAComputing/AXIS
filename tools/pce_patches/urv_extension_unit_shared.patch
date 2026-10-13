@@ -1,0 +1,72 @@
+--- a/hardware/urv/design/execute/urv_extension_unit.py	2026-10-04 22:57:54
++++ b/hardware/urv/design/execute/urv_extension_unit.py	2026-10-04 22:57:54
+@@ -78,6 +78,7 @@
+         thread_id_bits: int = 1,
+         pipelined: bool = False,
+         second_operand_sources: Mapping[str, str] | None = None,
++        shared_semantics=None,
+         name_prefix: str = "urv_ext_unit",
+     ) -> None:
+         if registry is None or len(registry) == 0:
+@@ -92,6 +93,14 @@
+         self.thread_id_bits = thread_id_bits
+         self.pipelined = pipelined
+         self.name_prefix = name_prefix
++        # Optional: ONE datapath for every registered extension, in place of
++        # one semantics callable each.  Called once as
++        #   shared_semantics(matches, src0, src1, immediate) -> xlen wire
++        # with ``matches`` the per-extension match wires in registry order.
++        # A generator that has merged the extensions' operators (AXIS's
++        # ``extension_datapath``) supplies it; the registry's own semantics
++        # are then not elaborated at all.
++        self.shared_semantics = shared_semantics
+         registered_mnemonics = {
+             ext.descriptor.mnemonic for ext in self.registry
+         }
+@@ -197,14 +206,15 @@
+                 ) == "immediate"
+                 else self.issue_src1
+             )
+-            result = ext.semantics(self.issue_src0, second_operand)
+-            if result.bitwidth != self.xlen:
+-                raise ValueError(
+-                    f"URV extension {ext.descriptor.mnemonic!r} semantics "
+-                    f"returned width {result.bitwidth}, expected {self.xlen}"
+-                )
+             match_wires.append(match)
+-            result_arms.append((match, result))
++            if self.shared_semantics is None:
++                result = ext.semantics(self.issue_src0, second_operand)
++                if result.bitwidth != self.xlen:
++                    raise ValueError(
++                        f"URV extension {ext.descriptor.mnemonic!r} semantics "
++                        f"returned width {result.bitwidth}, expected {self.xlen}"
++                    )
++                result_arms.append((match, result))
+             latency_arms.append((
+                 match,
+                 pyrtl.Const(ext.descriptor.latency_cycles, latency_bits),
+@@ -213,7 +223,22 @@
+         any_match = match_wires[0]
+         for m in match_wires[1:]:
+             any_match = any_match | m
+-        match_result = priority_mux(result_arms, default=pyrtl.Const(0, self.xlen))
++        if self.shared_semantics is None:
++            match_result = priority_mux(
++                result_arms, default=pyrtl.Const(0, self.xlen),
++            )
++        else:
++            match_result = self.shared_semantics(
++                list(match_wires),
++                self.issue_src0,
++                self.issue_src1,
++                self.issue_immediate,
++            )
++            if match_result.bitwidth != self.xlen:
++                raise ValueError(
++                    "URV shared extension semantics returned width "
++                    f"{match_result.bitwidth}, expected {self.xlen}"
++                )
+         match_latency = priority_mux(
+             latency_arms, default=pyrtl.Const(1, latency_bits),
+         )

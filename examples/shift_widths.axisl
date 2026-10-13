@@ -1,0 +1,150 @@
+; At what width is a shift amount read?
+;
+; Every other question about an operator's arguments had an answer: the type
+; atom gives the evaluation width, and it flows to the arguments. A shift amount
+; is an argument, so it should be read at that width -- `(shl i8 v n)` shifts by
+; the low eight bits of `n` -- and until this corpus existed, no backend did
+; that and no two of them disagreed the same way.
+;
+; The golden model shifted by the whole value and masked afterwards. The C and
+; Rust headers clamped at 64, the *register* width. The executors masked with
+; `& 63`, also the register width. SMT-LIB resized the amount to the operand's
+; sort, because `bvshl` takes both at one sort and there is no other option --
+; which is what settles it: a rule that keeps the full value is a rule that
+; backend cannot implement, so the rule is the one it already follows.
+;
+; The disagreement was not theoretical. At width 8 an amount of 256 shifted by
+; nothing in SMT and by everything everywhere else; an amount of 70 shifted by
+; six in the executors and by everything in the headers. And the golden model
+; did not merely disagree -- `v << 2**63` asks Python to build an integer with
+; more bits than the machine has memory for, so a corpus that shifted by an
+; unmasked register crashed the reference with a MemoryError.
+;
+; RISC-V never noticed because its shifts mask the amount themselves, which is
+; what an ISA does when the hardware has a five- or six-bit shift field. A
+; description language cannot assume that.
+;
+; The narrow nodes below are the whole point: at 64 bits the amount cannot
+; exceed the width in a way the old rules got wrong, so a corpus of 64-bit
+; shifts proves nothing about this.
+(axis-module shift_widths
+  (version "1.0.0")
+  (target rvmt)
+  (description "Shift amounts read at the node's evaluation width")
+
+  (defisa shiftisa
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64")
+    (memory-model rvwmo)
+    (endianness little))
+
+  (definstruction shl_narrow
+    (mnemonic SHL_NARROW)
+    (isa shiftisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 0)
+    (func7 0)
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in)
+      (rs2 reg i64 in))
+    (asm "shl.narrow $rd, $rs1, $rs2")
+    (semantics "Shift left at eight bits, by an amount read at eight bits")
+    (formal (zext i64 8 (shl i8 rs1 rs2)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "An amount of 256 is zero at this width, not a shift past it"))
+
+  (definstruction lshr_narrow
+    (mnemonic LSHR_NARROW)
+    (isa shiftisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 1)
+    (func7 0)
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in)
+      (rs2 reg i64 in))
+    (asm "lshr.narrow $rd, $rs1, $rs2")
+    (semantics "Logical right shift at eight bits")
+    (formal (zext i64 8 (lshr i8 rs1 rs2)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "The same question on the way down"))
+
+  (definstruction ashr_narrow
+    (mnemonic ASHR_NARROW)
+    (isa shiftisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 2)
+    (func7 0)
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in)
+      (rs2 reg i64 in))
+    (asm "ashr.narrow $rd, $rs1, $rs2")
+    (semantics "Arithmetic right shift at eight bits")
+    (formal (zext i64 8 (ashr i8 rs1 rs2)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "An amount past the width fills with the sign, not with zero"))
+
+  (definstruction shl_mid
+    (mnemonic SHL_MID)
+    (isa shiftisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 3)
+    (func7 0)
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in)
+      (rs2 reg i64 in))
+    (asm "shl.mid $rd, $rs1, $rs2")
+    (semantics "Shift left at sixteen bits")
+    (formal (zext i64 16 (shl i16 rs1 rs2)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "A width where the amount can exceed 64 and still be in range"))
+
+  (definstruction shl_wide
+    (mnemonic SHL_WIDE)
+    (isa shiftisa)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 4)
+    (func7 0)
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in)
+      (rs2 reg i64 in))
+    (asm "shl.wide $rd, $rs1, $rs2")
+    (semantics "Shift left at the full word, by whatever the register holds")
+    (formal (shl i64 rs1 rs2))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "The MemoryError case: an amount of 2**63 at the full width")))

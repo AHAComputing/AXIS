@@ -1,0 +1,266 @@
+; Predication over scalable vectors, stage S4 (docs/scalable_vectors_design.md).
+;
+; A predicate is not a new kind of value here: it is a vector whose lanes are 0
+; or 1. That falls out of the lane-indexed representation, and it is why most of
+; this stage composes rather than being built. `and` over two predicates is
+; ordinary lane arithmetic, so SVE's predicate logic needs no operators of its
+; own, and zeroing predication is the merging form with a broadcast zero.
+;
+; One difference from packed SIMD is architectural and worth stating. A packed
+; lane-wise compare writes a lane *mask* -- all-ones across the element -- which
+; is what NEON does, and `src/simd.rs` refuses comparisons rather than let a
+; `v4i32` compare quietly mean the wrong thing. A scalable compare writes one
+; *bit* per lane into a predicate, which is what SVE and RVV do. Same operator,
+; two representations, each correct for its architecture.
+;
+; `vmerge` is fully specified and composes anywhere. `vundef` says the inactive
+; lanes are *unspecified*, which is the other half of RVV's mask-agnostic
+; policy, and reuses stage S2's definedness machinery unchanged -- a length and
+; a predicate are two sources of the same per-lane question.
+(axis-module scalable_predicate
+  (version "0.1.0")
+  (target rvmt)
+  (description "Predicated arithmetic over scalable vectors")
+
+  (defisa sve_pred
+    (base rv64im)
+    (word-bits 64)
+    (vector-bits 128)
+    (unspecified-realization compute)
+    (registers "z[32]:i64" "pc:i64")
+    (features simd scalable predicated custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat SVE_P
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (zm 24 20)
+      (func7 31 25)))
+
+  ; A predicated operation names FOUR registers -- destination, governing
+  ; predicate, and two sources -- and SVE_P has fields for three. Seven
+  ; instructions here said `pg` in their operand list and had nowhere to put it,
+  ; so none of them could be encoded and none was ever executed.
+  ;
+  ; Three registers, a predicate and an opcode fit exactly: 7 + 5 + 3 + 5 + 5 + 5
+  ; leaves two bits of `func7`, which is enough because `func3` already tells all
+  ; seven apart.
+  (defformat SVE_PG
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (zm 24 20)
+      (pg 29 25)
+      (func7 31 30)))
+
+  ; Two shapes that name their sources something other than `zn`/`zm`. An
+  ; operand binds to the field whose name it matches, so `pa` bound to nothing
+  ; even though SVE_P has a field in exactly that position. The bits are the
+  ; same; what was missing is a format that calls them what the instruction
+  ; calls them.
+  (defformat SVE_PP
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (pa 19 15)
+      (pb 24 20)
+      (func7 31 25)))
+
+  (defformat SVE_WHILE
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (base 19 15)
+      (count 24 20)
+      (func7 31 25)))
+
+  (definstruction svcmplt_s
+    (mnemonic SVCMPLT_S) (isa sve_pred) (category simd) (format SVE_P)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "svcmplt_s $zd, ...")
+    (semantics "Signed compare, one predicate bit per lane")
+    (formal (icmp_slt vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Signed compare, one predicate bit per lane"))
+
+  (definstruction svcmpeq_h
+    (mnemonic SVCMPEQ_H) (isa sve_pred) (category simd) (format SVE_P)
+    (opcode 11) (func3 1) (func7 1)
+    (operands (zd reg i16 out) (zn reg i16 in) (zm reg i16 in))
+    (asm "svcmpeq_h $zd, ...")
+    (semantics "Equality compare into a predicate")
+    (formal (icmp_eq vni16 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Equality compare into a predicate"))
+
+  (definstruction svwhilelt_s
+    (mnemonic SVWHILELT_S) (isa sve_pred) (category simd) (format SVE_WHILE)
+    (opcode 11) (func3 2) (func7 2)
+    (operands (zd reg i32 out) (base reg i32 in) (count reg i32 in))
+    (asm "svwhilelt_s $zd, ...")
+    (semantics "Predicate active while base+lane < count")
+    (formal (vwhilelt vni32 base count))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Predicate active while base+lane < count"))
+
+  (definstruction svadd_m_s
+    (mnemonic SVADD_M_S) (isa sve_pred) (category simd) (format SVE_PG)
+    (opcode 11) (func3 3) (func7 1)
+    (operands (zd reg i32 inout) (pg reg i32 in) (zn reg i32 in) (zm reg i32 in))
+    (asm "svadd_m_s $zd, ...")
+    (semantics "Merging predicated add: inactive lanes keep zd")
+    (formal (vmerge vni32 pg (add vni32 zn zm) zd))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Merging predicated add: inactive lanes keep zd"))
+
+  (definstruction svmul_m_h
+    (mnemonic SVMUL_M_H) (isa sve_pred) (category simd) (format SVE_PG)
+    (opcode 11) (func3 4) (func7 1)
+    (operands (zd reg i16 inout) (pg reg i16 in) (zn reg i16 in) (zm reg i16 in))
+    (asm "svmul_m_h $zd, ...")
+    (semantics "Merging predicated multiply")
+    (formal (vmerge vni16 pg (mul vni16 zn zm) zd))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Merging predicated multiply"))
+
+  (definstruction svadd_z_s
+    (mnemonic SVADD_Z_S) (isa sve_pred) (category simd) (format SVE_PG)
+    (opcode 11) (func3 5) (func7 1)
+    (operands (zd reg i32 out) (pg reg i32 in) (zn reg i32 in) (zm reg i32 in))
+    (asm "svadd_z_s $zd, ...")
+    (semantics "Zeroing predicated add: the merging form with a broadcast zero")
+    (formal (vmerge vni32 pg (add vni32 zn zm) (vdup vni32 0)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Zeroing predicated add: the merging form with a broadcast zero"))
+
+  (definstruction svfadd_m_s
+    (mnemonic SVFADD_M_S) (isa sve_pred) (category simd) (format SVE_PG)
+    (opcode 11) (func3 6) (func7 1)
+    (operands (zd reg i32 inout) (pg reg i32 in) (zn reg i32 in) (zm reg i32 in))
+    (asm "svfadd_m_s $zd, ...")
+    (semantics "Merging predicated float add")
+    (formal (vmerge vnf32 pg (fadd vnf32 zn zm) zd))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Merging predicated float add"))
+
+  (definstruction svand_p_s
+    (mnemonic SVAND_P_S) (isa sve_pred) (category simd) (format SVE_PP)
+    (opcode 11) (func3 7) (func7 7)
+    (operands (zd reg i32 out) (pa reg i32 in) (pb reg i32 in))
+    (asm "svand_p_s $zd, ...")
+    (semantics "Predicate and: a predicate lane is a bit, so this is lane arithmetic")
+    (formal (and vni32 pa pb))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Predicate and: a predicate lane is a bit, so this is lane arithmetic"))
+
+  (definstruction svsub_m_b
+    (mnemonic SVSUB_M_B) (isa sve_pred) (category simd) (format SVE_PG)
+    (opcode 11) (func3 0) (func7 1)
+    (operands (zd reg i8 inout) (pg reg i8 in) (zn reg i8 in) (zm reg i8 in))
+    (asm "svsub_m_b $zd, ...")
+    (semantics "Merging predicated subtract over 8-bit lanes")
+    (formal (vmerge vni8 pg (sub vni8 zn zm) zd))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Merging predicated subtract over 8-bit lanes"))
+
+  ; --- inactive lanes left unspecified (stage S2's mechanism, mask source) ---
+
+  (definstruction svadd_u_s
+    (mnemonic SVADD_U_S) (isa sve_pred) (category simd) (format SVE_PG)
+    (opcode 11) (func3 1) (func7 1)
+    (operands (zd reg i32 out) (pg reg i32 in) (zn reg i32 in) (zm reg i32 in))
+    (asm "svadd_u_s $zd, ...")
+    (semantics "Predicated add whose inactive lanes are unspecified, not merged")
+    (formal (vundef vni32 pg (add vni32 zn zm)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Predicated add whose inactive lanes are unspecified, not merged"))
+
+  (definstruction svmul_u_h
+    (mnemonic SVMUL_U_H) (isa sve_pred) (category simd) (format SVE_PG)
+    (opcode 11) (func3 2) (func7 1)
+    (operands (zd reg i16 out) (pg reg i16 in) (zn reg i16 in) (zm reg i16 in))
+    (asm "svmul_u_h $zd, ...")
+    (semantics "Unspecified inactive lanes over 16-bit elements")
+    (formal (vundef vni16 pg (mul vni16 zn zm)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Unspecified inactive lanes over 16-bit elements"))
+
+  ; --- unpredicated counterparts ----------------------------------------
+  ;
+  ; These exist so predication can be checked against something other than
+  ; itself. Every backend derives its answer from the same description, so a
+  ; differential gate proves the implementations agree and cannot notice a
+  ; description that is uniformly wrong -- an inverted merge sense inverts every
+  ; backend identically. Pairing each predicated form with its unpredicated one
+  ; gives an independent architectural statement to test against:
+  ; merging with an active lane must equal the plain operation, and with an
+  ; inactive lane must equal the destination it was merging into.
+
+  (definstruction svadd_s
+    (mnemonic SVADD_S) (isa sve_pred) (category simd) (format SVE_P)
+    (opcode 11) (func3 0) (func7 16)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "svadd_s $zd, $zn, $zm")
+    (semantics "Unpredicated add, the reference a predicated form must agree with where its predicate is active")
+    (formal (add vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Unpredicated add"))
+
+  (definstruction svmul_h
+    (mnemonic SVMUL_H) (isa sve_pred) (category simd) (format SVE_P)
+    (opcode 11) (func3 1) (func7 17)
+    (operands (zd reg i16 out) (zn reg i16 in) (zm reg i16 in))
+    (asm "svmul_h $zd, $zn, $zm")
+    (semantics "Unpredicated multiply, the reference a predicated form must agree with where its predicate is active")
+    (formal (mul vni16 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Unpredicated multiply"))
+
+  (definstruction svsub_b
+    (mnemonic SVSUB_B) (isa sve_pred) (category simd) (format SVE_P)
+    (opcode 11) (func3 2) (func7 18)
+    (operands (zd reg i8 out) (zn reg i8 in) (zm reg i8 in))
+    (asm "svsub_b $zd, $zn, $zm")
+    (semantics "Unpredicated subtract, the reference a predicated form must agree with where its predicate is active")
+    (formal (sub vni8 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Unpredicated subtract"))
+
+  (definstruction svfadd_s
+    (mnemonic SVFADD_S) (isa sve_pred) (category simd) (format SVE_P)
+    (opcode 11) (func3 3) (func7 19)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "svfadd_s $zd, $zn, $zm")
+    (semantics "Unpredicated float add, the reference a predicated form must agree with where its predicate is active")
+    (formal (fadd vnf32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Unpredicated float add"))
+)

@@ -1,0 +1,811 @@
+; RVV: a scalable-vector ISA whose shapes come from a dynamic CSR.
+;
+; This is the other half of stage S7, and the half that exercises stage S3. SVE
+; encodes the element width in the instruction; RVV takes it from `vtype`, so
+; every instruction written against `vti` means a different shape at every
+; (SEW, LMUL) point and AXIS elaborates one point at a time while the ladder
+; sweeps them.
+;
+; `vti` is the integer shape vtype describes and `vtiw` its widened form: twice
+; the element at twice the register footprint. The two cancel, which is why a
+; widening operation has the same lane count as its operands.
+;
+; `vl` is *state*, not a mode, and the split matters: vtype changes shapes and
+; must be static, while vl changes extent and need not be. So `vsetvli` is an
+; ordinary instruction writing ordinary architectural state, and the tail policy
+; reads it.
+;
+; Both agnostic policies are described honestly rather than resolved. A
+; mask-agnostic or tail-agnostic element is architecturally *unspecified*: an
+; implementation may leave it undisturbed or write all-ones and both are
+; correct. What is specified is *which* elements, and that is what the ladder
+; compares -- exactly, without masking -- while the contents are left free and
+; fuzzed across realisations.
+;
+; Not described, and each for a stated reason: LMUL > 1 register grouping needs
+; the operand-to-register mapping that pure lane functions cannot express, and
+; `vfredusum` has no single architectural answer, so only the ordered reduction
+; exists here. `vrgather` was on that list and is not any more -- it reads its
+; index from a runtime vector, so it expands to a select tree quadratic in the
+; lane count, which is described up to a stated ceiling of 32 lanes rather than
+; refused.
+(axis-module rvv
+  (version "0.1.0")
+  (target rvmt)
+  (description "RVV scalable vectors: vtype-derived shapes, policies, memory")
+
+  (defisa rvv
+    (base rv64im)
+    (word-bits 64)
+    (vector-bits 128)
+    (vector-sew 32)
+    (vector-lmul 1)
+    (vector-elen 64)
+    (unspecified-realization compute)
+    (registers "v[32]:i64" "pc:i64" "vl:i64" "vxsat:i8" "mem_lo:i64" "mem_hi:i64")
+    (features simd scalable custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat RVV_V
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (vs1 19 15)
+      (vs2 24 20)
+      (func7 31 25)))
+
+  ; As in the SVE corpus: a memory form's base register is `rs1`, and RVV_V's
+  ; field of that name is the vector source slot. Same layout, names that bind.
+  ; One format per operand shape rather than one with every field: a field that
+  ; an instruction neither uses nor pins is unbound, and an instruction with an
+  ; unbound field is not encodable -- which is how the first attempt at these
+  ; left the plain load and store exactly as unrunnable as before.
+  ; The configuration form is not a vector-register instruction at all: it
+  ; takes a scalar length and writes a scalar, so `RVV_V`'s `vd`/`vs1`/`vs2`
+  ; are the wrong names for its bits and none of its operands bound to any of
+  ; them. Its own shape, by the same rule as the memory forms above -- and the
+  ; reason it needs stating is that an instruction whose operands bind to
+  ; nothing is not encodable, has no fixture, and is therefore executed by no
+  ; gate at all. `vtypei` is pinned because this corpus fixes SEW and LMUL in
+  ; the behavior rather than decoding them.
+  ; A scalar destination in the vector destination's bits. `vcpop.m rd, vs2`
+  ; writes an x register, and an operand binds to the field whose name it
+  ; matches, so `rd` bound to nothing. Same bits, the name the instruction uses.
+  (defformat RVV_VX
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (vs1 19 15)
+      (vs2 24 20)
+      (func7 31 25)))
+
+  ; A slide's background source, which sits where `vs1` does and is called `vb`.
+  (defformat RVV_VB
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (vb 19 15)
+      (vs2 24 20)
+      (func7 31 25)))
+
+  ; Two shapes that name a fourth register the three-register format cannot
+  ; hold: the vector length a tail policy reads, and the mask register a
+  ; predicated form reads. Three registers, a fourth and an opcode fit exactly
+  ; -- 7 + 5 + 3 + 5 + 5 + 5 leaves two bits of `func7`, enough because `func3`
+  ; already tells these apart.
+  (defformat RVV_V_VL
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (vs1 19 15)
+      (vs2 24 20)
+      (vl 29 25)
+      (func7 31 30)))
+
+  (defformat RVV_V_MASK
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (vs1 19 15)
+      (vs2 24 20)
+      (v0 29 25)
+      (func7 31 30)))
+
+  (defformat RVV_VSET
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (avl 19 15)
+      (vtypei 24 20)
+      (func7 31 25)))
+
+  (defformat RVV_MEM
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (func7 31 25)))
+
+  (defformat RVV_MEM_ST
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vs3 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (func7 31 25)))
+
+  (defformat RVV_MEM_STRIDED
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (defformat RVV_MEM_INDEXED
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (vs2 24 20)
+      (func7 31 25)))
+
+  (defformat RVV_MEM_ST_INDEXED
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vs3 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (vs2 24 20)
+      (func7 31 25)))
+
+  (defformat RVV_MEM2
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd0 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (vd1 24 20)
+      (func7 31 25)))
+
+  (definstruction vadd_vv
+    (mnemonic VADD_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 1) (func7 1)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vadd.vv $vd, $vs2, $vs1")
+    (semantics "Add; element width and lane count both come from vtype")
+    (formal (add vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Add; element width and lane count both come from vtype"))
+
+  (definstruction vsub_vv
+    (mnemonic VSUB_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 2) (func7 2)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vsub.vv $vd, $vs2, $vs1")
+    (semantics "Subtract; element width and lane count both come from vtype")
+    (formal (sub vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Subtract; element width and lane count both come from vtype"))
+
+  (definstruction vand_vv
+    (mnemonic VAND_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 3) (func7 3)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vand.vv $vd, $vs2, $vs1")
+    (semantics "Bitwise and; element width and lane count both come from vtype")
+    (formal (and vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Bitwise and; element width and lane count both come from vtype"))
+
+  (definstruction vor_vv
+    (mnemonic VOR_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 4) (func7 4)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vor.vv $vd, $vs2, $vs1")
+    (semantics "Bitwise or; element width and lane count both come from vtype")
+    (formal (or vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Bitwise or; element width and lane count both come from vtype"))
+
+  (definstruction vxor_vv
+    (mnemonic VXOR_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 5) (func7 5)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vxor.vv $vd, $vs2, $vs1")
+    (semantics "Bitwise xor; element width and lane count both come from vtype")
+    (formal (xor vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Bitwise xor; element width and lane count both come from vtype"))
+
+  (definstruction vmax_vv
+    (mnemonic VMAX_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 6) (func7 6)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vmax.vv $vd, $vs2, $vs1")
+    (semantics "Signed maximum; element width and lane count both come from vtype")
+    (formal (max vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Signed maximum; element width and lane count both come from vtype"))
+
+  (definstruction vminu_vv
+    (mnemonic VMINU_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 7) (func7 7)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vminu.vv $vd, $vs2, $vs1")
+    (semantics "Unsigned minimum; element width and lane count both come from vtype")
+    (formal (minu vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Unsigned minimum; element width and lane count both come from vtype"))
+
+  (definstruction vmul_vv
+    (mnemonic VMUL_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 0) (func7 8)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vmul.vv $vd, $vs2, $vs1")
+    (semantics "Multiply, low half")
+    (formal (mul vti vs1 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Multiply, low half"))
+
+  (definstruction vwadd_vv
+    (mnemonic VWADD_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 1) (func7 9)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vwadd.vv $vd, $vs2, $vs1")
+    (semantics "Widening signed add: 2*SEW result at 2*LMUL, so the lane count is unchanged")
+    (formal (vwadd vtiw vti vs1 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening signed add: 2*SEW result at 2*LMUL, so the lane count is unchanged"))
+
+  (definstruction vwaddu_vv
+    (mnemonic VWADDU_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 2) (func7 10)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vwaddu.vv $vd, $vs2, $vs1")
+    (semantics "Widening unsigned add: 2*SEW result at 2*LMUL, so the lane count is unchanged")
+    (formal (vwaddu vtiw vti vs1 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening unsigned add: 2*SEW result at 2*LMUL, so the lane count is unchanged"))
+
+  (definstruction vwsub_vv
+    (mnemonic VWSUB_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 3) (func7 11)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vwsub.vv $vd, $vs2, $vs1")
+    (semantics "Widening signed subtract: 2*SEW result at 2*LMUL, so the lane count is unchanged")
+    (formal (vwsub vtiw vti vs1 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening signed subtract: 2*SEW result at 2*LMUL, so the lane count is unchanged"))
+
+  (definstruction vwmul_vv
+    (mnemonic VWMUL_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 4) (func7 12)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vwmul.vv $vd, $vs2, $vs1")
+    (semantics "Widening signed multiply: 2*SEW result at 2*LMUL, so the lane count is unchanged")
+    (formal (vwmul vtiw vti vs1 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening signed multiply: 2*SEW result at 2*LMUL, so the lane count is unchanged"))
+
+  (definstruction vwmulu_vv
+    (mnemonic VWMULU_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 5) (func7 13)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vwmulu.vv $vd, $vs2, $vs1")
+    (semantics "Widening unsigned multiply: 2*SEW result at 2*LMUL, so the lane count is unchanged")
+    (formal (vwmulu vtiw vti vs1 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Widening unsigned multiply: 2*SEW result at 2*LMUL, so the lane count is unchanged"))
+
+  (definstruction vnsrl_wv
+    (mnemonic VNSRL_WV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 6) (func7 14)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vnsrl.wv $vd, $vs2, $vs1")
+    (semantics "Narrowing logical shift right: the shift amount is the low lg2(2*SEW) bits, stated rather than assumed")
+    (formal (vnsrl vti vtiw vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Narrowing logical shift right: the shift amount is the low lg2(2*SEW) bits, stated rather than assumed"))
+
+  (definstruction vnsra_wv
+    (mnemonic VNSRA_WV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 7) (func7 15)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vnsra.wv $vd, $vs2, $vs1")
+    (semantics "Narrowing arithmetic shift right: the shift amount is the low lg2(2*SEW) bits, stated rather than assumed")
+    (formal (vnsra vti vtiw vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Narrowing arithmetic shift right: the shift amount is the low lg2(2*SEW) bits, stated rather than assumed"))
+
+  (definstruction vmslt_vv
+    (mnemonic VMSLT_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 0) (func7 16)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vmslt.vv $vd, $vs2, $vs1")
+    (semantics "Set-less-than into a mask, one bit per element")
+    (formal (icmp_slt vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Set-less-than into a mask, one bit per element"))
+
+  (definstruction vmseq_vv
+    (mnemonic VMSEQ_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 1) (func7 17)
+    (operands (vd vreg i64 out) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vmseq.vv $vd, $vs2, $vs1")
+    (semantics "Set-equal into a mask")
+    (formal (icmp_eq vti vs1 vs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Set-equal into a mask"))
+
+  (definstruction vadd_vv_tu
+    (mnemonic VADD_VV_TU) (isa rvv) (category simd) (format RVV_V_MASK)
+    (opcode 87) (func3 2) (func7 3)
+    (operands (vd vreg i64 inout) (v0 vreg i64 in) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vadd.vv.tu $vd, $vs2, $vs1, $v0")
+    (semantics "Masked add, mask-undisturbed: inactive elements keep vd")
+    (formal (vmerge vti v0 (add vti vs1 vs2) vd))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Masked add, mask-undisturbed: inactive elements keep vd"))
+
+  (definstruction vadd_vv_ma
+    (mnemonic VADD_VV_MA) (isa rvv) (category simd) (format RVV_V_MASK)
+    (opcode 87) (func3 3) (func7 3)
+    (operands (vd vreg i64 out) (v0 vreg i64 in) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vadd.vv.ma $vd, $vs2, $vs1, $v0")
+    (semantics "Masked add, mask-agnostic: inactive elements are unspecified, and which ones is not")
+    (formal (vundef vti v0 (add vti vs1 vs2)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Masked add, mask-agnostic: inactive elements are unspecified, and which ones is not"))
+
+  (definstruction vadd_vv_ta
+    (mnemonic VADD_VV_TA) (isa rvv) (category simd) (format RVV_V_VL)
+    (opcode 87) (func3 4) (func7 3)
+    (operands (vd vreg i64 out) (vl reg i64 in) (vs1 vreg i64 in) (vs2 vreg i64 in))
+    (asm "vadd.vv.ta $vd, $vs2, $vs1, $vl")
+    (semantics "Add with a tail-agnostic policy: elements at or above vl are unspecified")
+    (formal (vtail vti vl (add vti vs1 vs2)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Add with a tail-agnostic policy: elements at or above vl are unspecified"))
+
+  (definstruction vredsum_vs
+    (mnemonic VREDSUM_VS) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 5) (func7 21)
+    (encoding (vs1 0))
+    (operands (vd vreg i64 out) (vs2 vreg i64 in))
+    (asm "vredsum.vs $vd, $vs2")
+    (semantics "Sum every element into a scalar")
+    (formal (vredsum vti vs2))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Sum every element into a scalar"))
+
+  (definstruction vredmaxu_vs
+    (mnemonic VREDMAXU_VS) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 6) (func7 22)
+    (encoding (vs1 0))
+    (operands (vd vreg i64 out) (vs2 vreg i64 in))
+    (asm "vredmaxu.vs $vd, $vs2")
+    (semantics "Unsigned maximum across elements")
+    (formal (vredmaxu vti vs2))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Unsigned maximum across elements"))
+
+  (definstruction vslideup_vi
+    (mnemonic VSLIDEUP_VI) (isa rvv) (category simd) (format RVV_VB)
+    (opcode 87) (func3 7) (func7 23)
+    (operands (vd vreg i64 out) (vs2 vreg i64 in) (vb vreg i64 in))
+    (asm "vslideup.vi $vd, $vs2, $vb")
+    (semantics "Slide up by one; the elements below the offset are undisturbed, which is why a background operand is named")
+    (formal (vslideup vti vs2 vb 1))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Slide up by one; the elements below the offset are undisturbed, which is why a background operand is named"))
+
+  (definstruction vslidedown_vi
+    (mnemonic VSLIDEDOWN_VI) (isa rvv) (category simd) (format RVV_VB)
+    (opcode 87) (func3 0) (func7 24)
+    (operands (vd vreg i64 out) (vs2 vreg i64 in) (vb vreg i64 in))
+    (asm "vslidedown.vi $vd, $vs2, $vb")
+    (semantics "Slide down by one; the tail takes the background")
+    (formal (vslidedown vti vs2 vb 1))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Slide down by one; the tail takes the background"))
+
+  (definstruction vle32_v
+    (mnemonic VLE32_V) (isa rvv) (category custom) (format RVV_MEM)
+    (opcode 7) (func3 1) (func7 25)
+    (operands (vd vreg i32 out) (rs1 reg i64 in))
+    (asm "vle32.v $vd, ($rs1)")
+    (semantics "Unit-stride load of 32-bit elements")
+    (behavior (set vd (vload vni32 rs1)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride load of 32-bit elements"))
+
+  (definstruction vse32_v
+    (mnemonic VSE32_V) (isa rvv) (category custom) (format RVV_MEM_ST)
+    (opcode 39) (func3 2) (func7 26)
+    (operands (vs3 vreg i32 in) (rs1 reg i64 in))
+    (asm "vse32.v $vs3, ($rs1)")
+    (semantics "Unit-stride store of 32-bit elements")
+    (behavior (store (vaddr vni32 rs1) vs3 i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Unit-stride store of 32-bit elements"))
+
+  (definstruction vlse32_v
+    (mnemonic VLSE32_V) (isa rvv) (category custom) (format RVV_MEM_STRIDED)
+    (opcode 7) (func3 3) (func7 27)
+    (operands (vd vreg i32 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "vlse32.v $vd, ($rs1), $rs2")
+    (semantics "Strided load of 32-bit elements")
+    (behavior (set vd (vload_strided vni32 rs1 rs2)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Strided load of 32-bit elements"))
+
+  (definstruction vlseg2e32_v
+    (mnemonic VLSEG2E32_V) (isa rvv) (category custom) (format RVV_MEM2)
+    (opcode 7) (func3 4) (func7 28)
+    (operands (vd0 vreg i32 out) (vd1 vreg i32 out) (rs1 reg i64 in))
+    (asm "vlseg2e32.v $vd0, $vd1, ($rs1)")
+    (semantics "Two-field segment load")
+    (behavior (set vd0 (vload_seg vni32 2 0 rs1))
+      (set vd1 (vload_seg vni32 2 1 rs1)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Two-field segment load"))
+
+  (definstruction vle32ff_v
+    (mnemonic VLE32FF_V) (isa rvv) (category custom) (format RVV_MEM)
+    (opcode 7) (func3 5) (func7 29)
+    (operands (vd vreg i32 out) (rs1 reg i64 in))
+    (asm "vle32ff.v $vd, ($rs1)")
+    (semantics "Fault-only-first load: stops at the first element that would leave the accessible region")
+    (behavior (set vd (vload_ff vni32 rs1 mem_lo mem_hi)))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 3.0) (expected-speedup 2.0)
+    (rationale "Fault-only-first load: stops at the first element that would leave the accessible region"))
+
+  (definstruction vsetvli
+    (mnemonic VSETVLI) (isa rvv) (category custom) (format RVV_VSET)
+    (opcode 87) (func3 7) (func7 30) (encoding (vtypei 0))
+    (operands (rd reg i64 out) (avl reg i64 in))
+    (asm "vsetvli $rd, $avl")
+    (semantics "Set the active vector length to min(avl, VLMAX) and report it")
+    (behavior
+      (setstate vl (minu i64 avl 4) i64)
+      (set rd (minu i64 avl 4)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 500.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "vl is state an instruction reads, so setting it is an ordinary state write"))
+
+  (definstruction vluxei32_v
+    (mnemonic VLUXEI32_V) (isa rvv) (category custom) (format RVV_MEM_INDEXED)
+    (opcode 7) (func3 5) (func7 60)
+    (operands (vd vreg i32 out) (rs1 reg i64 in) (vs2 vreg i64 in))
+    (asm "vluxei32.v $vd, ($rs1), $vs2")
+    (semantics "Indexed (gather) load: element i reads rs1 + vs2[i]")
+    (behavior (set vd (vload_indexed vni32 rs1 vs2)))
+    (latency 5) (throughput 1.0)
+    (area-estimate-um2 2500.0) (power-estimate-mw 4.0) (expected-speedup 1.5)
+    (rationale "Gather takes its offset from the lane's own index element, so it is an ordinary per-lane address function"))
+
+  (definstruction vsuxei32_v
+    (mnemonic VSUXEI32_V) (isa rvv) (category custom) (format RVV_MEM_ST_INDEXED)
+    (opcode 39) (func3 6) (func7 61)
+    (operands (vs3 vreg i32 in) (rs1 reg i64 in) (vs2 vreg i64 in))
+    (asm "vsuxei32.v $vs3, ($rs1), $vs2")
+    (semantics "Indexed (scatter) store: element i writes rs1 + vs2[i]")
+    (behavior (store (vaddr_indexed vni32 rs1 vs2) vs3 i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 2500.0) (power-estimate-mw 4.0) (expected-speedup 1.5)
+    (rationale "Scatter is the same address function in the location instead of the value"))
+
+  (definstruction vrgather_vv
+    (mnemonic VRGATHER_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 2) (func7 62)
+    (operands (vd vreg i64 out) (vs2 vreg i64 in) (vs1 vreg i64 in))
+    (asm "vrgather.vv $vd, $vs2, $vs1")
+    (semantics "Gather: element i reads source element vs1[i], or zero when that index is out of range")
+    (formal (vrgather vti vs2 vs1))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 3000.0) (power-estimate-mw 5.0) (expected-speedup 1.5)
+    (rationale "The one permute whose source lane is chosen at runtime, so it expands to a select tree rather than a static map"))
+
+  ; --- mask manipulation --------------------------------------------------
+  ;
+  ; All six are the same question asked differently: where does this element sit
+  ; relative to the active elements before it? `viota` reports that prefix count
+  ; directly; the three set-first masks are comparisons against it; `vcpop` is
+  ; the count over the whole vector and `vfirst` the position of the earliest
+  ; active element.
+  ;
+  ; They needed no new machinery. The prefix count was written for `vcompress`,
+  ; which packs *by* it, and extracting it made this family fall out -- which is
+  ; the usual sign that a construct was decomposed at the right joint.
+  ;
+  ; `vcpop` and `vfirst` produce a scalar, so they collapse to one instruction
+  ; each rather than one per lane, exactly as a reduction does.
+
+  (definstruction viota_m
+    (mnemonic VIOTA_M) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 7) (func7 63)
+    (encoding (vs1 0))
+    (operands (vd vreg i32 out) (vs2 vreg i32 in))
+    (asm "viota.m $vd, $vs2")
+    (semantics "Prefix count: element i is the number of active mask elements before it")
+    (formal (viota vni32 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Prefix count: element i is the number of active mask elements before it"))
+
+  (definstruction vmsbf_m
+    (mnemonic VMSBF_M) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 0) (func7 64)
+    (encoding (vs1 0))
+    (operands (vd vreg i32 out) (vs2 vreg i32 in))
+    (asm "vmsbf.m $vd, $vs2")
+    (semantics "Set before first: active until the first set mask element")
+    (formal (vmsbf vni32 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Set before first: active until the first set mask element"))
+
+  (definstruction vmsif_m
+    (mnemonic VMSIF_M) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 1) (func7 65)
+    (encoding (vs1 0))
+    (operands (vd vreg i32 out) (vs2 vreg i32 in))
+    (asm "vmsif.m $vd, $vs2")
+    (semantics "Set including first: as vmsbf but the first set element is included")
+    (formal (vmsif vni32 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Set including first: as vmsbf but the first set element is included"))
+
+  (definstruction vmsof_m
+    (mnemonic VMSOF_M) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 2) (func7 66)
+    (encoding (vs1 0))
+    (operands (vd vreg i32 out) (vs2 vreg i32 in))
+    (asm "vmsof.m $vd, $vs2")
+    (semantics "Set only first: active at the first set mask element alone")
+    (formal (vmsof vni32 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Set only first: active at the first set mask element alone"))
+
+  (definstruction vcpop_m
+    (mnemonic VCPOP_M) (isa rvv) (category simd) (format RVV_VX)
+    (opcode 87) (func3 3) (func7 67)
+    (encoding (vs1 0))
+    (operands (rd reg i32 out) (vs2 vreg i32 in))
+    (asm "vcpop.m $rd, $vs2")
+    (semantics "Count the active mask elements into a scalar")
+    (formal (vcpop vni32 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Count the active mask elements into a scalar"))
+
+  (definstruction vfirst_m
+    (mnemonic VFIRST_M) (isa rvv) (category simd) (format RVV_VX)
+    (opcode 87) (func3 4) (func7 68)
+    (encoding (vs1 0))
+    (operands (rd reg i32 out) (vs2 vreg i32 in))
+    (asm "vfirst.m $rd, $vs2")
+    (semantics "Index of the first active mask element, or -1 when there is none")
+    (formal (vfirst vni32 vs2))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Index of the first active mask element, or -1 when there is none"))
+
+  ; --- float predicates and fixed-point saturation ------------------------
+  ;
+  ; None of these needed a new operator. Letting the IEEE comparisons and
+  ; `select` through the lane-local vocabulary was enough, and saturating
+  ; arithmetic then composes out of what was already there: an unsigned add
+  ; saturates when its sum falls below either operand, and a signed one when the
+  ; operands share a sign the result does not.
+  ;
+  ; Writing them compositionally rather than as primitives is the honest form --
+  ; the overflow rule is *in* the description, where it can be read and argued
+  ; with, instead of hidden inside an operator name. The cost is that the
+  ; expression repeats its sum, since the language has no way to bind an
+  ; intermediate; at four lanes that is cheap and at sixty-four it would not be.
+  ;
+  ; Not modelled: the `vxsat` sticky flag those instructions set. That is a state
+  ; write, so it needs a behavior rather than a formal, and it would make these
+  ; effectful instructions rather than pure ones.
+
+  (definstruction vmfeq_vv
+    (mnemonic VMFEQ_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 6) (func7 70)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vmfeq.vv $vd, $vs2, $vs1")
+    (semantics "Float equality into a mask, one bit per element")
+    (formal (fcmp_oeq vnf32 vs1 vs2))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1400.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Float equality into a mask, one bit per element"))
+
+  (definstruction vmflt_vv
+    (mnemonic VMFLT_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 7) (func7 71)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vmflt.vv $vd, $vs2, $vs1")
+    (semantics "Float less-than into a mask")
+    (formal (fcmp_olt vnf32 vs1 vs2))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1400.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Float less-than into a mask"))
+
+  (definstruction vmfle_vv
+    (mnemonic VMFLE_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 0) (func7 72)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vmfle.vv $vd, $vs2, $vs1")
+    (semantics "Float less-or-equal into a mask")
+    (formal (fcmp_ole vnf32 vs1 vs2))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1400.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Float less-or-equal into a mask"))
+
+  (definstruction vsaddu_vv
+    (mnemonic VSADDU_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 1) (func7 73)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vsaddu.vv $vd, $vs2, $vs1")
+    (semantics "Unsigned saturating add: a sum below either operand has wrapped")
+    (formal (select vni32 (icmp_ult vni32 (add vni32 vs1 vs2) vs1) 0xffffffff (add vni32 vs1 vs2)))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1400.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Unsigned saturating add: a sum below either operand has wrapped"))
+
+  (definstruction vssubu_vv
+    (mnemonic VSSUBU_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 2) (func7 74)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vssubu.vv $vd, $vs2, $vs1")
+    (semantics "Unsigned saturating subtract: clamps at zero")
+    (formal (select vni32 (icmp_ult vni32 vs1 vs2) 0 (sub vni32 vs1 vs2)))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1400.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Unsigned saturating subtract: clamps at zero"))
+
+  (definstruction vsadd_vv
+    (mnemonic VSADD_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 3) (func7 75)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vsadd.vv $vd, $vs2, $vs1")
+    (semantics "Signed saturating add: overflow when the operands share a sign the result does not")
+    (formal (select vni32 (lshr vni32 (and vni32 (xor vni32 vs1 (add vni32 vs1 vs2)) (xor vni32 vs2 (add vni32 vs1 vs2))) 31) (select vni32 (icmp_slt vni32 vs1 0) 0x80000000 0x7fffffff) (add vni32 vs1 vs2)))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1400.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Signed saturating add: overflow when the operands share a sign the result does not"))
+
+  (definstruction vssub_vv
+    (mnemonic VSSUB_VV) (isa rvv) (category simd) (format RVV_V)
+    (opcode 87) (func3 4) (func7 76)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vssub.vv $vd, $vs2, $vs1")
+    (semantics "Signed saturating subtract: overflow when the operands differ in sign and the result differs from vs1")
+    (formal (select vni32 (lshr vni32 (and vni32 (xor vni32 vs1 vs2) (xor vni32 vs1 (sub vni32 vs1 vs2))) 31) (select vni32 (icmp_slt vni32 vs1 0) 0x80000000 0x7fffffff) (sub vni32 vs1 vs2)))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1400.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Signed saturating subtract: overflow when the operands differ in sign and the result differs from vs1"))
+
+  (definstruction vmv_x_s
+    (mnemonic VMV_X_S) (isa rvv) (category simd) (format RVV_VX)
+    (opcode 87) (func3 5) (func7 77)
+    (encoding (vs1 0))
+    (operands (rd reg i32 out) (vs2 vreg i32 in))
+    (asm "vmv.x.s $rd, $vs2")
+    (semantics "Move element 0 to a scalar register")
+    (formal (vextract vni32 vs2 0))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1400.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Move element 0 to a scalar register"))
+
+  ; --- saturation with its sticky flag ------------------------------------
+  ;
+  ; The pure forms above compute the saturated value and say nothing about
+  ; vxsat. A real machine sets that flag when saturation occurs and leaves it
+  ; set until software clears it, so the flag is *sticky* -- which means the
+  ; instruction reads the old value and ors into it, and that makes these
+  ; effectful rather than pure.
+  ;
+  ; Both forms are kept. The pure ones state the saturation rule where it can be
+  ; read; these state what the machine also records. Splitting them that way is
+  ; not how a real description would be organised, but it keeps the arithmetic
+  ; legible in one place and the flag legible in another.
+  ;
+  ; `vxsat` is architectural state, and state is scalar: one flag, not one per
+  ; lane. Lane instantiation therefore has to know which symbols are state and
+  ; leave them alone -- otherwise the sticky read becomes `vxsat__l0`, a name
+  ; nothing declares.
+
+  (definstruction vsaddu_vv_x
+    (mnemonic VSADDU_VV_X) (isa rvv) (category custom) (format RVV_V)
+    (opcode 87) (func3 0) (func7 80)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vsaddu.vv.x $vd, $vs2, $vs1")
+    (semantics "Unsigned saturating add that records saturation in vxsat")
+    (behavior
+      (set vd (select vni32 (icmp_ult vni32 (add vni32 vs1 vs2) vs1) 0xffffffff (add vni32 vs1 vs2)))
+      (setstate vxsat (or i8 vxsat (icmp_ult vni32 (add vni32 vs1 vs2) vs1)) i8))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Unsigned saturating add that records saturation in vxsat"))
+
+  (definstruction vssubu_vv_x
+    (mnemonic VSSUBU_VV_X) (isa rvv) (category custom) (format RVV_V)
+    (opcode 87) (func3 1) (func7 81)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vssubu.vv.x $vd, $vs2, $vs1")
+    (semantics "Unsigned saturating subtract that records saturation")
+    (behavior
+      (set vd (select vni32 (icmp_ult vni32 vs1 vs2) 0 (sub vni32 vs1 vs2)))
+      (setstate vxsat (or i8 vxsat (icmp_ult vni32 vs1 vs2)) i8))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Unsigned saturating subtract that records saturation"))
+
+  (definstruction vsadd_vv_x
+    (mnemonic VSADD_VV_X) (isa rvv) (category custom) (format RVV_V)
+    (opcode 87) (func3 2) (func7 82)
+    (operands (vd vreg i32 out) (vs1 vreg i32 in) (vs2 vreg i32 in))
+    (asm "vsadd.vv.x $vd, $vs2, $vs1")
+    (semantics "Signed saturating add that records saturation")
+    (behavior
+      (set vd (select vni32 (lshr vni32 (and vni32 (xor vni32 vs1 (add vni32 vs1 vs2)) (xor vni32 vs2 (add vni32 vs1 vs2))) 31) (select vni32 (icmp_slt vni32 vs1 0) 0x80000000 0x7fffffff) (add vni32 vs1 vs2)))
+      (setstate vxsat (or i8 vxsat (lshr vni32 (and vni32 (xor vni32 vs1 (add vni32 vs1 vs2)) (xor vni32 vs2 (add vni32 vs1 vs2))) 31)) i8))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 1.5)
+    (rationale "Signed saturating add that records saturation"))
+)

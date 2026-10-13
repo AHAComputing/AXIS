@@ -1,0 +1,329 @@
+; Cross-lane operations over scalable vectors, stage S6.
+;
+; A reduction is the one shape in this language that does *not* become one
+; instruction per lane. It reads every lane and produces a single result, so it
+; stays a single instruction whose operands are the lanes -- one declared `zn`
+; becomes zn__l0 .. zn__lN. That is why operands are derived from the lanes an
+; expression names rather than renamed one for one: a per-lane instruction names
+; exactly one, a reduction names them all, and only a rule that asks the
+; expression serves both.
+;
+; The float reductions are spelled separately from the integer ones and their
+; nesting is written out explicitly, because floating-point addition is not
+; associative: (a+b)+c and a+(b+c) can differ, so a reduction has no value at
+; all until its order is pinned. Two orders are pinned here -- `vfredosum` folds
+; left to right and `vfredpsum` folds a balanced tree, which is what SVE's FADDV
+; specifies -- and they are genuinely different instructions, not two spellings
+; of one.
+;
+; `vfredusum` is the third case and it used to say, right here, that it "has no
+; single architectural answer, so only the ordered one is described here rather
+; than described wrongly". That was true of a language with one fold shape. With
+; two it has an answer of exactly the right kind: it is whichever of them the
+; ISA's `(reduction-realization ...)` names, and the ladder runs both.
+;
+; The knob is deliberately NOT the definedness mask that covers unspecified
+; lanes. A mask says which lanes are free; an unordered reduction is one fully
+; defined value drawn from a set of admissible ones, and there is no lane to
+; mark. `tools/reduction_order_check.py` sweeps it and requires the two orders
+; to differ somewhere -- an unordered reduction no input can tell apart from an
+; ordered one is not being proven.
+(axis-module scalable_crosslane
+  (version "0.1.0")
+  (target rvmt)
+  (description "Cross-lane reductions over scalable vectors")
+
+  (defisa sve_cross
+    (base rv64im)
+    (word-bits 64)
+    (vector-bits 128)
+    (reduction-realization sequential)
+    (registers "z[32]:i64" "pc:i64")
+    (features simd scalable custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat SVE_X
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (zm 24 20)
+      (func7 31 25)))
+
+  ; A slide's background operand sits where `zm` does and is called `zb`. Same
+  ; bits, the name the instruction uses.
+  (defformat SVE_XB
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (zb 24 20)
+      (func7 31 25)))
+
+  ; Compress names four registers: destination, source, governing predicate and
+  ; the background the inactive lanes take. Three registers, a predicate and an
+  ; opcode fit exactly, leaving two bits of `func7`.
+  (defformat SVE_XC
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (pg 24 20)
+      (zb 29 25)
+      (func7 31 30)))
+
+  (definstruction vredsum_s
+    (mnemonic VREDSUM_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 0) (func7 0)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "vredsum_s $zd, $zn")
+    (semantics "Sum every 32-bit lane into a scalar")
+    (formal (vredsum vni32 zn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.5) (expected-speedup 2.0)
+    (rationale "Sum every 32-bit lane into a scalar"))
+
+  (definstruction vredand_s
+    (mnemonic VREDAND_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 1) (func7 1)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "vredand_s $zd, $zn")
+    (semantics "Bitwise and across 32-bit lanes")
+    (formal (vredand vni32 zn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.5) (expected-speedup 2.0)
+    (rationale "Bitwise and across 32-bit lanes"))
+
+  (definstruction vredxor_s
+    (mnemonic VREDXOR_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 2) (func7 2)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "vredxor_s $zd, $zn")
+    (semantics "Bitwise xor across 32-bit lanes")
+    (formal (vredxor vni32 zn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.5) (expected-speedup 2.0)
+    (rationale "Bitwise xor across 32-bit lanes"))
+
+  (definstruction vredmax_h
+    (mnemonic VREDMAX_H) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 3) (func7 3)
+    (encoding (zm 0))
+    (operands (zd reg i16 out) (zn reg i16 in))
+    (asm "vredmax_h $zd, $zn")
+    (semantics "Signed maximum across 16-bit lanes")
+    (formal (vredmax vni16 zn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.5) (expected-speedup 2.0)
+    (rationale "Signed maximum across 16-bit lanes"))
+
+  (definstruction vredminu_b
+    (mnemonic VREDMINU_B) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 4) (func7 4)
+    (encoding (zm 0))
+    (operands (zd reg i8 out) (zn reg i8 in))
+    (asm "vredminu_b $zd, $zn")
+    (semantics "Unsigned minimum across 8-bit lanes")
+    (formal (vredminu vni8 zn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.5) (expected-speedup 2.0)
+    (rationale "Unsigned minimum across 8-bit lanes"))
+
+  (definstruction vfredosum_s
+    (mnemonic VFREDOSUM_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 5) (func7 5)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "vfredosum_s $zd, $zn")
+    (semantics "Ordered sum of 32-bit float lanes, left to right")
+    (formal (vfredosum vnf32 zn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.5) (expected-speedup 2.0)
+    (rationale "Ordered sum of 32-bit float lanes, left to right"))
+
+  (definstruction vfredpsum_s
+    (mnemonic VFREDPSUM_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 5) (func7 16)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "vfredpsum_s $zd, $zn")
+    (semantics "Tree sum of 32-bit float lanes: halves reduced, then combined")
+    (formal (vfredpsum vnf32 zn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.5) (expected-speedup 2.0)
+    (rationale "SVE's FADDV is a tree, and a tree is a different value from a left fold"))
+
+  (definstruction vfredusum_s
+    (mnemonic VFREDUSUM_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 5) (func7 17)
+    (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "vfredusum_s $zd, $zn")
+    (semantics "Sum of 32-bit float lanes in an order the architecture does not fix")
+    (formal (vfredusum vnf32 zn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.5) (expected-speedup 2.0)
+    (rationale "The unordered reduction, realised as one of the orders this language pins"))
+
+  ; --- structured permutes ------------------------------------------------
+  ;
+  ; Each of these is a *static* map from an output lane to an input lane, so in
+  ; the lane-indexed representation a permute is nothing more than reading a
+  ; different lane's operand -- the same shape the address functions took in S5.
+  ; No operator support is needed beyond the index.
+  ;
+  ; The slides take a background operand rather than inventing a zero for the
+  ; lanes that fall off the end. RVV's vslideup leaves those lanes undisturbed
+  ; and vslidedown's tail follows the tail policy, so a model that filled them
+  ; with zero would be describing neither; naming the background is what lets a
+  ; document say which it means.
+  ;
+  ; A *dynamic* permute is a different problem. `vrgather` reads a lane index
+  ; from a runtime vector, so it cannot be a static map -- it needs a select
+  ; tree over every lane, quadratic in the lane count. It is described, up to a
+  ; stated ceiling of 32 lanes, in the two corpora whose architectures have one:
+  ; `examples/rvv.axisl` as `vrgather.vv` and `examples/sve.axisl` as its table
+  ; lookup. Not here, because this corpus is the *static* vocabulary and a
+  ; quadratic expansion would dominate every count it reports.
+
+  (definstruction vzip1_s
+    (mnemonic VZIP1_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 6) (func7 6)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "vzip1_s $zd, $zn, $zm")
+    (semantics "Interleave the low halves")
+    (formal (vzip1 vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Interleave the low halves"))
+
+  (definstruction vzip2_s
+    (mnemonic VZIP2_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 7) (func7 7)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "vzip2_s $zd, $zn, $zm")
+    (semantics "Interleave the high halves")
+    (formal (vzip2 vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Interleave the high halves"))
+
+  (definstruction vuzp1_s
+    (mnemonic VUZP1_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 0) (func7 8)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "vuzp1_s $zd, $zn, $zm")
+    (semantics "Take every even element of the concatenation")
+    (formal (vuzp1 vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Take every even element of the concatenation"))
+
+  (definstruction vuzp2_s
+    (mnemonic VUZP2_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 1) (func7 9)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "vuzp2_s $zd, $zn, $zm")
+    (semantics "Take every odd element of the concatenation")
+    (formal (vuzp2 vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Take every odd element of the concatenation"))
+
+  (definstruction vtrn1_s
+    (mnemonic VTRN1_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 2) (func7 10)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "vtrn1_s $zd, $zn, $zm")
+    (semantics "Transpose even pairs")
+    (formal (vtrn1 vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Transpose even pairs"))
+
+  (definstruction vtrn2_s
+    (mnemonic VTRN2_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 3) (func7 11)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "vtrn2_s $zd, $zn, $zm")
+    (semantics "Transpose odd pairs")
+    (formal (vtrn2 vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Transpose odd pairs"))
+
+  (definstruction vext1_s
+    (mnemonic VEXT1_S) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 4) (func7 12)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "vext1_s $zd, $zn, $zm")
+    (semantics "Window across the concatenation at offset 1")
+    (formal (vext vni32 zn zm 1))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Window across the concatenation at offset 1"))
+
+  (definstruction vslideup2_s
+    (mnemonic VSLIDEUP2_S) (isa sve_cross) (category simd) (format SVE_XB)
+    (opcode 11) (func3 5) (func7 13)
+    (operands (zd reg i32 out) (zn reg i32 in) (zb reg i32 in))
+    (asm "vslideup2_s $zd, $zn, $zb")
+    (semantics "Slide up by 2; lanes below the offset take the background")
+    (formal (vslideup vni32 zn zb 2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Slide up by 2; lanes below the offset take the background"))
+
+  (definstruction vslidedown2_s
+    (mnemonic VSLIDEDOWN2_S) (isa sve_cross) (category simd) (format SVE_XB)
+    (opcode 11) (func3 6) (func7 14)
+    (operands (zd reg i32 out) (zn reg i32 in) (zb reg i32 in))
+    (asm "vslidedown2_s $zd, $zn, $zb")
+    (semantics "Slide down by 2; lanes past the end take the background")
+    (formal (vslidedown vni32 zn zb 2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Slide down by 2; lanes past the end take the background"))
+
+  (definstruction vzip1_h
+    (mnemonic VZIP1_H) (isa sve_cross) (category simd) (format SVE_X)
+    (opcode 11) (func3 7) (func7 15)
+    (operands (zd reg i16 out) (zn reg i16 in) (zm reg i16 in))
+    (asm "vzip1_h $zd, $zn, $zm")
+    (semantics "Interleave 16-bit lanes")
+    (formal (vzip1 vni16 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.5) (expected-speedup 2.0)
+    (rationale "Interleave 16-bit lanes"))
+
+  ; --- compress: the output *position* depends on the mask ----------------
+  ;
+  ; A gather asks which source lane an output lane reads, and gets a runtime
+  ; answer. A compress asks which output lane a source lane *lands in*, and the
+  ; answer is a prefix count over the mask -- so every output lane has to test
+  ; every source lane against a running total that is itself a sum over earlier
+  ; lanes. Cubic where a gather is quadratic, which is why its ceiling is lower.
+  ;
+  ; Output lanes past the number of active elements take the background, as RVV
+  ; leaves them undisturbed.
+  (definstruction vcompress_s
+    (mnemonic VCOMPRESS_S) (isa sve_cross) (category simd) (format SVE_XC)
+    (opcode 11) (func3 4) (func7 1)
+    (operands (zd reg i32 out) (zn reg i32 in) (pg reg i32 in) (zb reg i32 in))
+    (asm "vcompress_s $zd, $zn, $pg, $zb")
+    (semantics "Pack the active elements of zn into the low lanes; the rest take zb")
+    (formal (vcompress vni32 zn pg zb))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 2200.0) (power-estimate-mw 3.5) (expected-speedup 1.5)
+    (rationale "The one cross-lane shape whose output position, not just its source, is decided at runtime"))
+)

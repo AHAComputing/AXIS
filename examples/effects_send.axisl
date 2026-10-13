@@ -1,0 +1,101 @@
+; A machine that posts messages.
+;
+; ⚠️ This is the corpus for the one effect that leaves the machine without
+; leaving an address behind. A `send` is a store whose destination is a channel
+; rather than a location: it evaluates two expressions, emits one ordered
+; event, and continues. An event-driven core's *instruction* does exactly that
+; -- what makes such a core hard is when it RUNS, which is a machine model and
+; not an instruction's effect, and is deliberately not described here.
+;
+; Three shapes, because three things can go wrong independently: the port can
+; be computed, the payload can be computed, and the whole thing can be guarded.
+(axis-module xsend
+  (version "1.0")
+  (target rvmt)
+
+  (defisa rv32_send
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32")
+    (features m custom)
+    (memory-model rvwmo)
+    (endianness little)
+  )
+
+  ; The plain form: a register names the channel, a register carries the value.
+  (definstruction send_r
+    (mnemonic SEND_R)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 0)
+    (func7 20)
+    (encoding (rd 0))
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+    )
+    (asm "send $rs2, ($rs1)")
+    (behavior
+      (send rs1 rs2 i32)
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+
+  ; A computed port. ⚠️ The destination is an expression for the same reason a
+  ; store's address is: a machine that can only post to a constant channel is
+  ; not one anybody builds.
+  (definstruction send_o
+    (mnemonic SEND_O)
+    (category custom)
+    (format I)
+    (opcode 11)
+    (func3 1)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (imm imm i12 in)
+    )
+    (asm "send_o $rs1, $imm")
+    (behavior
+      (send (add i32 rs1 (sext i32 12 imm)) rs1 i32)
+      (set rd (add i32 rs1 1))
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+
+  ; A guarded send: posted only when the payload is non-zero. ⚠️ The case that
+  ; separates "this happened" from "this was evaluated" -- an engine that
+  ; logged every send it computed would report a message this machine does not
+  ; post.
+  (definstruction send_nz
+    (mnemonic SEND_NZ)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 2)
+    (func7 20)
+    (encoding (rd 0))
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+    )
+    (asm "send_nz $rs2, ($rs1)")
+    (behavior
+      (when (ne rs2 0) (send rs1 rs2 i32))
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+)

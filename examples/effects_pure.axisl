@@ -1,0 +1,86 @@
+(axis-module xeff
+  (version "1.0")
+  (target rvmt)
+
+  (defisa rv32_eff
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32")
+    (features m custom)
+    (memory-model rvwmo)
+    (endianness little)
+  )
+
+  (definstruction fma
+    (mnemonic FMA)
+    (category custom)
+    ; R4, because a three-source instruction is what that format is for: under
+    ; R the third source binds to no field, so the operand is encoded nowhere
+    ; and the instruction has no fixture -- which is to say no executor ever
+    ; ran the one instruction this corpus exists to be the baseline for.
+    (format R4)
+    (opcode 11)
+    (func3 0)
+    (encoding (func2 1))
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (rs3 reg i32 in)
+    )
+    (asm "fma $rd, $rs1, $rs2, $rs3")
+    (behavior
+      (set rd (add (mul rs1 rs2) rs3))
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+
+  (definstruction andn
+    (mnemonic ANDN)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 0)
+    (func7 32)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+    )
+    (asm "andn $rd, $rs1, $rs2")
+    (behavior
+      (set rd (and rs1 (not i32 rs2)))
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+
+  (definstruction sextb
+    (mnemonic SEXTB)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 1)
+    (func7 48) (encoding (rs2 0))
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+    )
+    (asm "sextb $rd, $rs1")
+    (behavior
+      (set rd (sext i32 8 rs1))
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+)

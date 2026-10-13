@@ -1,0 +1,125 @@
+; Bounded loops (src/loops.rs).
+;
+;   (iterate <type> (<index> <count>) (<acc> <init>) <body>)
+;
+; acc_0 is init, acc_{k+1} is the body with the index bound to the literal k and
+; the accumulator bound to acc_k, and the loop is acc_count.
+;
+; What this expresses that lane expansion cannot: iterations that *depend on
+; each other*. Lane expansion requires lane-local operators precisely because
+; each lane is independent -- `src/simd.rs` refuses anything else, and rightly.
+; A loop carries an accumulator forward, so a population count, a parity scan or
+; a bit reversal becomes describable, and none of those has a lane-wise
+; spelling.
+;
+; The bound is static, and that is why this costs no backend work at all. An
+; unrolled loop is ordinary semantics, so all five backends and every executor
+; already handle it -- the same argument that made scalable lane instantiation
+; free. A dynamic trip count is a bounded loop plus a guard, which is exactly
+; what `vtail` already does for lanes.
+;
+; The corpus pairs each loop-defined operation with the built-in it must equal.
+; That is deliberate: `cpop` is already a primitive, so a loop that computes it
+; has a reference inside the language rather than needing one written beside it,
+; and tools/loop_equivalence.py proves the two agree for *every* input rather
+; than sampling.
+(axis-module loops
+  (version "0.1.0")
+  (target rvmt)
+  (description "Bounded loops as elaboration-time unrolling")
+
+  (defisa loops
+    (base rv64im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat LOOP_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (zm 24 20)
+      (func7 31 25)))
+
+  (definstruction cpop_loop_s
+    (mnemonic CPOP_LOOP_S) (isa loops) (category custom) (format LOOP_R)
+    (opcode 11) (func3 0) (func7 0) (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "cpop_loop_s $zd, $zn")
+    (semantics "Population count defined by a loop, not by a primitive")
+    (formal (iterate i32 (i 32) (acc 0) (add i32 acc (and i32 (lshr i32 zn i) 1))))
+    (latency 8) (throughput 1.0)
+    (area-estimate-um2 800.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Population count defined by a loop, not by a primitive"))
+
+  (definstruction cpop_prim_s
+    (mnemonic CPOP_PRIM_S) (isa loops) (category custom) (format LOOP_R)
+    (opcode 11) (func3 1) (func7 1) (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "cpop_prim_s $zd, $zn")
+    (semantics "Population count as the built-in operator: the reference the loop must equal")
+    (formal (cpop i32 zn))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 800.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Population count as the built-in operator: the reference the loop must equal"))
+
+  (definstruction cpop_loop_h
+    (mnemonic CPOP_LOOP_H) (isa loops) (category custom) (format LOOP_R)
+    (opcode 11) (func3 2) (func7 2) (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "cpop_loop_h $zd, $zn")
+    (semantics "Population count over 16 bits by loop")
+    (formal (zext i32 16 (iterate i16 (i 16) (acc 0) (add i16 acc (and i16 (lshr i16 zn i) 1)))))
+    (latency 6) (throughput 1.0)
+    (area-estimate-um2 800.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Population count over 16 bits by loop"))
+
+  (definstruction cpop_prim_h
+    (mnemonic CPOP_PRIM_H) (isa loops) (category custom) (format LOOP_R)
+    (opcode 11) (func3 3) (func7 3) (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "cpop_prim_h $zd, $zn")
+    (semantics "Population count over 16 bits, built in")
+    (formal (zext i32 16 (cpop i16 zn)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 800.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Population count over 16 bits, built in"))
+
+  (definstruction parity_loop_s
+    (mnemonic PARITY_LOOP_S) (isa loops) (category custom) (format LOOP_R)
+    (opcode 11) (func3 4) (func7 4) (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "parity_loop_s $zd, $zn")
+    (semantics "Parity: the same scan folding with xor instead of add")
+    (formal (iterate i32 (i 32) (acc 0) (xor i32 acc (and i32 (lshr i32 zn i) 1))))
+    (latency 8) (throughput 1.0)
+    (area-estimate-um2 800.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Parity: the same scan folding with xor instead of add"))
+
+  (definstruction revbits_loop_h
+    (mnemonic REVBITS_LOOP_H) (isa loops) (category custom) (format LOOP_R)
+    (opcode 11) (func3 5) (func7 5) (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "revbits_loop_h $zd, $zn")
+    (semantics "Bit reversal: each iteration shifts what the last one built, which is the shape lane expansion cannot express")
+    (formal (zext i32 16 (iterate i16 (i 16) (acc 0) (or i16 (shl i16 acc 1) (and i16 (lshr i16 zn i) 1)))))
+    (latency 6) (throughput 1.0)
+    (area-estimate-um2 800.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Bit reversal: each iteration shifts what the last one built, which is the shape lane expansion cannot express"))
+
+  (definstruction sumshift_loop_s
+    (mnemonic SUMSHIFT_LOOP_S) (isa loops) (category custom) (format LOOP_R)
+    (opcode 11) (func3 6) (func7 6) (encoding (zm 0))
+    (operands (zd reg i32 out) (zn reg i32 in))
+    (asm "sumshift_loop_s $zd, $zn")
+    (semantics "Sum of the four bytes: a loop whose index scales the shift")
+    (formal (iterate i32 (i 4) (acc 0) (add i32 acc (and i32 (lshr i32 zn (mul i32 i 8)) 255))))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 800.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Sum of the four bytes: a loop whose index scales the shift"))
+)

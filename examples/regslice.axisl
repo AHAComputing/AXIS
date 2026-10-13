@@ -1,0 +1,103 @@
+; Register slices: overlapping views of one register.
+;
+; A register class used to say only how *wide* a view is, and a write masked the
+; value to that width and overwrote the whole register. That is exactly right
+; for AArch64, where writing W0 zeroes the upper half of X0 -- and it cannot
+; describe an architecture that preserves, or a view that does not start at the
+; low bit.
+;
+; The five instructions here write the same storage through five views:
+;
+;   movq_r   64 bits            -- the whole register
+;   movl_r   32 bits, zeroing   -- like x86 EAX, and like AArch64's W
+;   movw_r   16 bits, preserving-- like x86 AX
+;   movb_lo   8 bits, preserving-- like x86 AL
+;   movb_hi   8 bits at offset 8-- like x86 AH, which has no other expression
+;
+; The distinguishing observation is not what lands in the view; it is what
+; happens to the bits *outside* it. A test that reads back only the view it
+; wrote through cannot tell zeroing from preserving, so the reference checks the
+; whole register.
+(axis-module regslice
+  (version "0.1.0")
+  (target rvmt)
+  (description "Overlapping register views with distinct write policies")
+
+  (defisa slices
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[16]:i64" "pc:i64")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat SLICE_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (rs 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction movq_r
+    (mnemonic MOVQ_R) (isa slices) (category custom) (format SLICE_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 0) (func7 0)
+    (operands (rd x86_r64 i64 out) (rs x86_r64 i64 in))
+    (asm "movq_r $rd, $rs")
+    (semantics "Write the full 64-bit view")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Write the full 64-bit view"))
+
+  (definstruction movl_r
+    (mnemonic MOVL_R) (isa slices) (category custom) (format SLICE_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 1) (func7 1)
+    (operands (rd x86_r32 i32 out) (rs x86_r32 i32 in))
+    (asm "movl_r $rd, $rs")
+    (semantics "Write the 32-bit view; the upper 32 bits become zero")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Write the 32-bit view; the upper 32 bits become zero"))
+
+  (definstruction movw_r
+    (mnemonic MOVW_R) (isa slices) (category custom) (format SLICE_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 2) (func7 2)
+    (operands (rd x86_r16 i16 out) (rs x86_r16 i16 in))
+    (asm "movw_r $rd, $rs")
+    (semantics "Write the 16-bit view; the upper 48 bits are preserved")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Write the 16-bit view; the upper 48 bits are preserved"))
+
+  (definstruction movb_lo
+    (mnemonic MOVB_LO) (isa slices) (category custom) (format SLICE_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 3) (func7 3)
+    (operands (rd x86_r8lo i8 out) (rs x86_r8lo i8 in))
+    (asm "movb_lo $rd, $rs")
+    (semantics "Write the low byte; the upper 56 bits are preserved")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Write the low byte; the upper 56 bits are preserved"))
+
+  (definstruction movb_hi
+    (mnemonic MOVB_HI) (isa slices) (category custom) (format SLICE_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 4) (func7 4)
+    (operands (rd x86_r8hi i8 out) (rs x86_r8hi i8 in))
+    (asm "movb_hi $rd, $rs")
+    (semantics "Write the second byte, at bit offset 8; everything else preserved")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Write the second byte, at bit offset 8; everything else preserved"))
+)

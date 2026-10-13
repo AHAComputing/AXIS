@@ -1,0 +1,60 @@
+; One finite template describes four AArch64 shifted-register variants.
+(axis-module lisp-aarch64-family
+  (version "0.2.0")
+  (target translation)
+
+  (defisa aarch64
+    (role source)
+    (base aarch64)
+    (word-bits 64)
+    (registers "x[31]:i64" "sp:i64" "nzcv:i4")
+    (features base)
+    (memory-model weak)
+    (endianness little))
+
+  (defformat add-sub-shifted
+    (bits 32)
+    (fields
+      (sf 31)
+      (op 30)
+      (fixed 29 24)
+      (shift 23 22)
+      (zero 21)
+      (rm 20 16)
+      (amount 15 10)
+      (rn 9 5)
+      (rd 4 0)))
+
+  (definstruction-family add-sub-shifted-family
+    ($name $mnemonic $sf $op $type $rd-kind $rn-kind $rm-kind $semantic $asm)
+    ((ADD-W-SHIFT ADD_W_SHIFT 0 0 i32 a64_gpr32sp a64_gpr32sp a64_gpr32 add
+       "add $rd, $rn, $rm, $shift $amount")
+     (SUB-W-SHIFT SUB_W_SHIFT 0 1 i32 a64_gpr32sp a64_gpr32sp a64_gpr32 sub
+       "sub $rd, $rn, $rm, $shift $amount")
+     (ADD-X-SHIFT ADD_X_SHIFT 1 0 i64 a64_gpr64sp a64_gpr64sp a64_gpr64 add
+       "add $rd, $rn, $rm, $shift $amount")
+     (SUB-X-SHIFT SUB_X_SHIFT 1 1 i64 a64_gpr64sp a64_gpr64sp a64_gpr64 sub
+       "sub $rd, $rn, $rm, $shift $amount"))
+    (definstruction $name
+      (mnemonic $mnemonic)
+      (isa aarch64)
+      (format add-sub-shifted)
+      (encoding (sf $sf) (op $op) (fixed #b001011) (zero 0))
+      (operands
+        (rd $rd-kind $type out)
+        (rn $rn-kind $type in)
+        (rm $rm-kind $type in)
+        (shift imm i2 in)
+        (amount imm i6 in))
+      (asm $asm)
+      (requires (a64-shifted-reg $type shift amount))
+      (use-properties shifted-register-cost)
+      (behavior
+        (set rd
+          ($semantic $type rn
+            (a64-shift-reg $type rm shift amount))))))
+
+  ; Forward-declared fragment used inside the family template.
+  (defproperties shifted-register-cost
+    (latency 2)
+    (throughput 1.0)))

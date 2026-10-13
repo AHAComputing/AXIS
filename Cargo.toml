@@ -1,0 +1,19 @@
+[package]
+name = "axis_adl"
+version = "0.1.0"
+edition = "2021"
+description = "AXIS architecture description language compiler"
+license = "MIT"
+
+[lib]
+name = "axis_adl"
+path = "src/lib.rs"
+# `rlib` for the `axis` binary and the tests; `staticlib` and `cdylib` so a
+# compiled consumer can link the lifter instead of spawning the CLI.
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "axis"
+path = "src/main.rs"
+
+[dependencies]

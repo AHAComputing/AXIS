@@ -1,0 +1,46 @@
+; First complete Lisp-authored AXIS module.
+(axis-module lisp-module
+  (version "0.2.0")
+  (target generic)
+  (description "Typed semantic definitions and document elaboration")
+
+  (defformat select-r4
+    (bits 32)
+    (fields
+      (func2 31 30)
+      (rs3 29 25)
+      (rs2 24 20)
+      (rs1 19 15)
+      (func3 14 12)
+      (rd 11 7)
+      (opcode 6 0)))
+
+  (defsem choose-arithmetic
+    ((condition i32) (lhs i32) (rhs i32))
+    i32
+    (let ((sum (add i32 lhs rhs))
+          (difference (sub i32 lhs rhs)))
+      (if i32 condition sum difference)))
+
+  (defsem invert-choice
+    ((condition i32) (lhs i32) (rhs i32))
+    i32
+    (not i32 (choose-arithmetic condition lhs rhs)))
+
+  (definstruction SELECT-INVERTED-ARITHMETIC
+    (mnemonic SELECT_INVERTED_ARITHMETIC)
+    (format select-r4)
+    (opcode #b0001011)
+    (func3 0)
+    (encoding (opcode #b0001011) (func3 0) (func2 0))
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (rs3 reg i32 in))
+    (asm "select.inverted $rd, $rs1, $rs2, $rs3")
+    (semantics "Select sum or difference and invert the result")
+    (formal (invert-choice rs1 rs2 rs3))
+    (latency 1)
+    (throughput 1.0)
+    (rationale "Proves nested defsem expansion before backend lowering")))

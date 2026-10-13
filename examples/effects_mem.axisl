@@ -1,0 +1,36 @@
+(axis-module xmem
+  (version "1.0")
+  (target rvmt)
+
+  (defisa rv32_mem
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32")
+    (features m custom)
+    (memory-model rvwmo)
+    (endianness little)
+  )
+
+  (definstruction lw_x
+    (mnemonic LW_X)
+    (category custom)
+    (format I)
+    (opcode 11)
+    (func3 2)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (imm imm i12 in)
+    )
+    (asm "lw_x $rd, $imm($rs1)")
+    (behavior
+      (set rd (load i32 signed (add rs1 imm)))
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+)

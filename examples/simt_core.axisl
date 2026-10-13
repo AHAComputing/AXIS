@@ -1,0 +1,469 @@
+; SIMT cores (docs/simt_design.md): one small ISA, `st32`, with the warp
+; operations a SIMT machine needs, and machines of different warp shapes.
+; This is the corpus `tools/simt_check.py` gates the SIMT engine on.
+;
+; ⚠️ Each SIMT instruction has a per-lane BEHAVIOR -- what every active lane
+; computes and hands the warp through `simt_*` state -- and the machine binds
+; its mnemonic to a ROLE: what the warp does with it. The independent-thread
+; judge runs each thread alone through the same behaviors, which is what makes
+; a SIMT run and a lone thread comparable at all.
+(axis-module simtcore
+  (version "1.0")
+  (target rvmt)
+  (description "A SIMT test ISA and warp machines of several shapes")
+
+  (defisa st32
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32"
+      "simt_pred:i1" "simt_arg:i32" "simt_arg2:i32" "simt_token:i32")
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; ---- the scalar ISA a lane runs ----------------------------------------
+
+  (definstruction stadd
+    (mnemonic STADD) (isa st32) (category custom) (format R) (opcode 0x0b)
+    (operands (rd rv_gpr i32 out) (rs1 rv_gpr i32 in) (rs2 rv_gpr i32 in))
+    (asm "stadd $rd, $rs1, $rs2")
+    (semantics "rd = rs1 + rs2")
+    (formal (add i32 rs1 rs2))
+    (latency 1))
+
+  (definstruction stmul
+    (mnemonic STMUL) (isa st32) (category custom) (format R) (opcode 0x2b)
+    (operands (rd rv_gpr i32 out) (rs1 rv_gpr i32 in) (rs2 rv_gpr i32 in))
+    (asm "stmul $rd, $rs1, $rs2")
+    (semantics "rd = rs1 * rs2")
+    (formal (mul i32 rs1 rs2))
+    (latency 3))
+
+  (definstruction staddi
+    (mnemonic STADDI) (isa st32) (category custom) (format I) (opcode 0x1b) (func3 0)
+    (operands (rd rv_gpr i32 out) (rs1 rv_gpr i32 in) (imm imm i32 in))
+    (asm "staddi $rd, $rs1, $imm")
+    (semantics "rd = rs1 + sign_extend(imm12)")
+    (behavior (set rd (add i32 rs1 (sext i32 12 imm))))
+    (latency 1))
+
+  (definstruction stlw
+    (mnemonic STLW) (isa st32) (category custom) (format I) (opcode 0x5b) (func3 2)
+    (operands (rd rv_gpr i32 out) (rs1 rv_gpr i32 in) (imm imm i32 in))
+    (asm "stlw $rd, $imm($rs1)")
+    (semantics "Load a 32-bit word")
+    (behavior (set rd (load i32 signed (add i32 rs1 (sext i32 12 imm)))))
+    (latency 2))
+
+  (definstruction stsw
+    (mnemonic STSW) (isa st32) (category custom) (format S) (opcode 0x7b) (func3 2)
+    (operands (rs1 rv_gpr i32 in) (rs2 rv_gpr i32 in) (imm imm i32 in))
+    (asm "stsw $rs2, $imm($rs1)")
+    (semantics "Store a 32-bit word")
+    (behavior (store (add i32 rs1 (sext i32 12 imm)) rs2 i32))
+    (latency 1))
+
+  (definstruction stbne
+    (mnemonic STBNE) (isa st32) (category custom) (format B) (opcode 0x4b) (func3 0)
+    (operands (rs1 rv_gpr i32 in) (rs2 rv_gpr i32 in) (imm imm i32 in))
+    (asm "stbne $rs1, $rs2, $imm")
+    (semantics "Branch when rs1 is not equal rs2")
+    (behavior (when (icmp_ne rs1 rs2) (setpc (add i32 pc (sext i32 13 imm)))))
+    (latency 1))
+
+  ; ---- the warp operations: per-lane halves ------------------------------
+
+  (definstruction stsplit
+    (mnemonic STSPLIT) (isa st32) (category custom) (format R) (opcode 0x3b) (func3 0)
+    (encoding (rs2 0))
+    (operands (rd rv_gpr i32 out) (rs1 rv_gpr i32 in))
+    (asm "stsplit $rd, $rs1")
+    (semantics "This lane's predicate is rs1 != 0; rd receives the reconvergence token")
+    (behavior
+      (setstate simt_pred (icmp_ne i32 rs1 0) i1)
+      (set rd simt_token))
+    (latency 1))
+
+  (definstruction stjoin
+    (mnemonic STJOIN) (isa st32) (category custom) (format R) (opcode 0x3b) (func3 1)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 rv_gpr i32 in))
+    (asm "stjoin $rs1")
+    (semantics "Hand the warp the token rs1")
+    (behavior (setstate simt_arg rs1 i32))
+    (latency 1))
+
+  (definstruction stpred
+    (mnemonic STPRED) (isa st32) (category custom) (format R) (opcode 0x3b) (func3 2)
+    (encoding (rd 0))
+    (operands (rs1 rv_gpr i32 in) (rs2 rv_gpr i32 in))
+    (asm "stpred $rs1, $rs2")
+    (semantics "This lane stays if rs1 != 0; rs2 is the mask if none stays")
+    (behavior
+      (setstate simt_pred (icmp_ne i32 rs1 0) i1)
+      (setstate simt_arg rs2 i32))
+    (latency 1))
+
+  (definstruction sttmc
+    (mnemonic STTMC) (isa st32) (category custom) (format R) (opcode 0x3b) (func3 3)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 rv_gpr i32 in))
+    (asm "sttmc $rs1")
+    (semantics "The warp's new thread mask; zero ends it")
+    (behavior (setstate simt_arg rs1 i32))
+    (latency 1))
+
+  (definstruction stbar
+    (mnemonic STBAR) (isa st32) (category custom) (format R) (opcode 0x3b) (func3 4)
+    (encoding (rd 0))
+    (operands (rs1 rv_gpr i32 in) (rs2 rv_gpr i32 in))
+    (asm "stbar $rs1, $rs2")
+    (semantics "Barrier rs1, for rs2 warps")
+    (behavior
+      (setstate simt_arg rs1 i32)
+      (setstate simt_arg2 rs2 i32))
+    (latency 1))
+
+  (definstruction stwsync
+    (mnemonic STWSYNC) (isa st32) (category custom) (format R) (opcode 0x3b) (func3 5)
+    (encoding (rd 0) (rs1 0) (rs2 0))
+    (operands)
+    (asm "stwsync")
+    (semantics "Wait until everything the warp issued has completed")
+    (implementation st_wsync)
+    (latency 1))
+
+  ; Events (tools/simt_check.py, EVENTS): a core may name these its wait and
+  ; send instructions; to a lone thread each does nothing.
+  (definstruction stwfe
+    (mnemonic STWFE) (isa st32) (category custom) (format R) (opcode 0x3b) (func3 6)
+    (encoding (rd 0) (rs1 0) (rs2 0))
+    (operands)
+    (asm "stwfe")
+    (semantics "Wait for an event")
+    (behavior (setstate simt_pred 0 i1))
+    (latency 1))
+
+  (definstruction stsev
+    (mnemonic STSEV) (isa st32) (category custom) (format R) (opcode 0x3b) (func3 7)
+    (encoding (rd 0) (rs1 0) (rs2 0))
+    (operands)
+    (asm "stsev")
+    (semantics "Send an event to every thread")
+    (behavior (setstate simt_pred 0 i1))
+    (latency 1))
+
+  (definstruction stcsrr
+    (mnemonic STCSRR) (isa st32) (category custom) (format I) (opcode 0x73) (func3 1)
+    (encoding (rs1 0))
+    (operands (rd rv_gpr i32 out) (imm imm i32 in))
+    (asm "stcsrr $rd, $imm")
+    (semantics "Read machine register imm: 0 thread id, 1 the warp's mask, 2 lanes")
+    (implementation st_csrr)
+    (latency 1))
+
+  ; ---- machines ----------------------------------------------------------
+  ; The gate's invariants need these shapes: one lane against eight on one
+  ; warp (uniform code costs the same), a narrow unit (occupancy), several
+  ; warps (scheduling, the judge across warps).
+
+  (defcore sc_w1l1
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 1) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore sc_w1l8
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore sc_w1l8n
+    (kind simt) (implements st32) (issue-width 1)
+    (units (alu (count 1) (lanes 2)))
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore sc_w4l8
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 4) (lanes 8) (scheduler gto) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; Implicit divergence (docs/simt_design.md 3d): no SPLIT, JOIN or PRED in
+  ; the program. The judge is the same -- every thread as it would run alone.
+  (defcore si_w1l8
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; Forward progress (tools/simt_check.py, PROGRESS): the same machine with a
+  ; path set aside after 16 instructions in a row while another waits.
+  (defcore si_w1l8p
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc) (progress 16))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; ... or a spin-loop hint: here the spin's load stands in for A64's YIELD.
+  (defcore si_w1l8r
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc) (relax STLW))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; ... or events: a waiting lane sleeps until a send (EVENTS).
+  (defcore si_w2l8e
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 2) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc) (events (wait STWFE) (send STSEV)))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore si_w2l8p
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 2) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc) (progress 16))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore si_w4l8
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 4) (lanes 8) (scheduler gto) (stack 8) (line 64)
+      (implicit (policy minpc))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; Out of order (docs/simt_design.md 3e): a window a warp. The judge is the
+  ; same; the invariants are the window's (tools/simt_check.py, WINDOW).
+  (defcore so_r4
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 1) (scheduler rr) (stack 8) (line 64)
+      (ooo (rob 4) (predictor none))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore so_r32
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 1) (scheduler rr) (stack 8) (line 64)
+      (ooo (rob 32) (predictor none))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore so_w4l8
+    (kind simt) (implements st32) (issue-width 2)
+    (simt (warps 4) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (ooo (rob 16) (predictor perfect))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore so_i_w4l8
+    (kind simt) (implements st32) (issue-width 2)
+    (simt (warps 4) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc))
+      (ooo (rob 16) (predictor perfect))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; The window's memory ordering and its predictors (MEMORY, PREDICT).
+  (defcore so_r32m
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 1) (scheduler rr) (stack 8) (line 64)
+      (ooo (rob 32) (predictor none) (memory-order true))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore so_r32p
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 1) (scheduler rr) (stack 8) (line 64)
+      (ooo (rob 32) (predictor perfect))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore so_r32b
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 1) (scheduler rr) (stack 8) (line 64)
+      (ooo (rob 32) (predictor bimodal) (entries 64))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; The divergence predictor (DIVERGE-PREDICT): implicit, one warp of eight.
+  (defcore so_i_l8
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc))
+      (ooo (rob 32) (predictor perfect))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; Paths issuing as SMT threads (tools/simt_check.py, SMTISSUE): the same
+  ; window with no branch predictor, one path at a time and as SMT threads.
+  (defcore so_i_l8n
+    (kind simt) (implements st32) (issue-width 1) (branch (penalty 6))
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc))
+      (ooo (rob 32) (predictor none))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore so_i_l8ns
+    (kind simt) (implements st32) (issue-width 1) (branch (penalty 6))
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc) (path-issue smt))
+      (ooo (rob 32) (predictor none))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore so_i_l8ns1
+    (kind simt) (implements st32) (issue-width 1) (branch (penalty 6))
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc) (path-issue smt 1))
+      (ooo (rob 32) (predictor none))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore so_i_l8d
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (implicit (policy minpc))
+      (ooo (rob 32) (predictor perfect) (entries 64) (divergence-predictor true))
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; A second level and a prefetcher (L2, PREFETCH): one warp of eight, a
+  ; stream of lines. All three wait for a line still on its way.
+  (defcore sc_tf
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4) (track-fills 1))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore sc_pf
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4) (track-fills 1) (prefetch-degree 4) (prefetch-entries 16))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore sc_l2
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4) (track-fills 1) (l2-bytes 65536) (l2-ways 4) (l2-hit 8))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore sc_nl
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4) (track-fills 1) (prefetch-degree 4) (prefetch-entries 16) (prefetch-next-line 1))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; The stride table with several warps on one load (PREFETCH4): every warp
+  ; must keep its own entry.
+  (defcore sc_pf4
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 4) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4) (track-fills 1) (prefetch-degree 4) (prefetch-entries 16))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; The best-offset prefetcher (BESTOFFSET): one warp's stream, and four
+  ; warps' interleaved ones.
+  (defcore sc_bo
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4) (track-fills 1) (prefetch-degree 1) (prefetch-entries 256) (prefetch-best-offset 1))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore sc_bo4
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 4) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4) (track-fills 1) (prefetch-degree 1) (prefetch-entries 256) (prefetch-best-offset 1))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore sc_tf4
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 4) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 4) (mshrs 4) (track-fills 1) )
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; U2 (docs/unified_engine_design.md): a SIMT core that is a port of a
+  ; described memory system, and its twin with a private cache of the same
+  ; shape -- same L1, same MSHRs, a fixed-latency memory behind it, no bus --
+  ; so the two must agree to the cycle (tools/simt_check.py, MEMSYS).
+  (defmemory sm_l1 (kind cache) (size-bytes 4096) (line-bytes 64) (ways 2) (latency-cycles 2)
+    (replacement lru) (write-policy write-back) (allocate write-allocate) (mshrs 4))
+  (defmemory sm_mem (kind scratchpad) (size-bytes 0x100000000) (width-bits 64) (latency-cycles 18))
+  (definterconnect sm_xbar (topology crossbar (ports 2)) (virtual-channels 1) (buffer-depth 1)
+    (flit-bits 64) (address-bits 48) (hop-cycles 0) (router-cycles 0))
+  (defmemsys sm_sys
+    (clock-ps 1000)
+    (interconnect sm_xbar)
+    (coherence (protocol none))
+    (nodes
+      (sm-l1 (memory sm_l1) (core sm_w1l8) (at 0 0) (next sm-mem))
+      (sm-mem (memory sm_mem) (at 1 0)))
+    (address-map (region 0x0 0x100000000 sm-mem)))
+
+  (defcore sm_w1l8
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  (defcore sm_w1l8p
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (cache (bytes 4096) (ways 2) (hit 2) (miss 20) (fill 0) (mshrs 4) (track-fills 1))
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+
+  ; ... and one whose memory system maps only the first 4 KiB: an access past
+  ; it must be refused, not charged nothing (MEMSYS).
+  (defmemsys sm_small
+    (clock-ps 1000)
+    (interconnect sm_xbar)
+    (coherence (protocol none))
+    (nodes
+      (sm-l1u (memory sm_l1) (core sm_w1l8u) (at 0 0) (next sm-memu))
+      (sm-memu (memory sm_mem) (at 1 0)))
+    (address-map (region 0x0 0x1000 sm-memu)))
+
+  (defcore sm_w1l8u
+    (kind simt) (implements st32) (issue-width 1)
+    (simt (warps 1) (lanes 8) (scheduler rr) (stack 8) (line 64)
+      (warp-control (split STSPLIT) (join STJOIN) (pred STPRED) (tmc STTMC) (bar STBAR) (wsync STWSYNC))
+      (sysread STCSRR (dst rd) (index (imm 1)))))
+)

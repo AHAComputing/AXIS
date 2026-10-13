@@ -1,0 +1,109 @@
+; bfloat16, which is not a value domain (docs/tensor_design.md, T1b).
+;
+; Every machine in the tensor inventory reads bf16 operands, widens them, and
+; accumulates in f32. Outside AArch64's FEAT_B16B16 there is no bf16 adder
+; anywhere, so a bf16 that could be computed in would be six backends of
+; machinery for an operation no description performs.
+;
+; It could not have had a row in `ir::FLOAT_FORMATS` in any case, and that is
+; the finding this stage is built on: the typed IR identifies a float format by
+; its WIDTH, and bf16 and f16 are both 16 bits. f16 fitted because 16 was free.
+; The second 16-bit format is where that representation runs out.
+;
+; So bf16 expands instead, exactly as SIMD lanes do and for the same reason it
+; can: bf16 IS f32's top half. Its exponent field is f32's, bit for bit, which
+; makes widening a shift and narrowing an add and a shift -- ordinary integer
+; expressions the language has had since the beginning. Nothing downstream
+; learns a third 16-bit format exists.
+;
+; What the expansion buys over writing the shift into each description is the
+; rounding. `(x + 0x7fff + ((x >> 16) & 1)) >> 16` is round-to-nearest-even and
+; it is not obvious; written once it is checked once, by `tools/bf16_check.py`,
+; against rounding computed in exact rational arithmetic rather than against a
+; second copy of itself.
+;
+; BFMAC is why any of this is here: two bf16 operands widened, multiplied and
+; accumulated in f32 is the inner step of every matrix unit in the inventory,
+; and it is describable today. It accumulates into its destination: B_R has
+; three register fields, and a fourth operand named an accumulator no word
+; could encode -- which the roundtrip gate caught and nothing else did.
+(axis-module bf16
+  (version "0.1.0")
+  (target rvmt)
+  (description "bfloat16 conversions and an f32-accumulating multiply")
+
+  (defisa bf32
+    (base rv32im)
+    (word-bits 32)
+    (registers "b[32]:i32" "pc:i32")
+    (features fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat B_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (bd 11 7)
+      (func3 14 12)
+      (bn 19 15)
+      (bm 24 20)
+      (func7 31 25)))
+
+  (definstruction bfcvt
+    (mnemonic BFCVT) (isa bf32) (category float) (format B_R)
+    (opcode 11) (func3 0) (func7 0)
+    (encoding (bm 0))
+    (operands (bd reg i32 out) (bn reg i32 in))
+    (asm "bfcvt $bd, $bn")
+    (semantics "Single to bfloat16, round to nearest with ties to even")
+    (formal (fcvt_f2f bf16 f32 bn))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "The rounding is the whole content of the format, so it is described once"))
+
+  (definstruction bfwiden
+    (mnemonic BFWIDEN) (isa bf32) (category float) (format B_R)
+    (opcode 11) (func3 1) (func7 0)
+    (encoding (bm 0))
+    (operands (bd reg i32 out) (bn reg i32 in))
+    (asm "bfwiden $bd, $bn")
+    (semantics "bfloat16 to single, which is exact for every pattern")
+    (formal (fcvt_f2f f32 bf16 bn))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 100.0) (power-estimate-mw 0.2) (expected-speedup 1.0)
+    (rationale "Widening a format that shares f32's exponent adds zeros and changes nothing"))
+
+  (definstruction bfmul
+    (mnemonic BFMUL) (isa bf32) (category float) (format B_R)
+    (opcode 11) (func3 2) (func7 0)
+    (operands (bd reg i32 out) (bn reg i32 in) (bm reg i32 in))
+    (asm "bfmul $bd, $bn, $bm")
+    (semantics "Two bfloat16 operands, multiplied in single precision")
+    (formal (fmul f32 (fcvt_f2f f32 bf16 bn) (fcvt_f2f f32 bf16 bm)))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1400.0) (power-estimate-mw 1.8) (expected-speedup 2.0)
+    (rationale "bf16 in, f32 out: the shape every machine in the inventory has"))
+
+  (definstruction bfmac
+    (mnemonic BFMAC) (isa bf32) (category float) (format B_R)
+    (opcode 11) (func3 3) (func7 0)
+    (operands (bd reg i32 inout) (bn reg i32 in) (bm reg i32 in))
+    (asm "bfmac $bd, $bn, $bm")
+    (semantics "Widen two bfloat16 operands, multiply and accumulate in single")
+    (formal (fadd f32 bd (fmul f32 (fcvt_f2f f32 bf16 bn) (fcvt_f2f f32 bf16 bm))))
+    (latency 5) (throughput 1.0)
+    (area-estimate-um2 2000.0) (power-estimate-mw 2.6) (expected-speedup 3.0)
+    (rationale "The inner step of every matrix unit in the inventory, describable today"))
+
+  (definstruction bfround_pair
+    (mnemonic BFROUND_PAIR) (isa bf32) (category float) (format B_R)
+    (opcode 11) (func3 4) (func7 0)
+    (operands (bd reg i32 out) (bn reg i32 in) (bm reg i32 in))
+    (asm "bfround_pair $bd, $bn, $bm")
+    (semantics "Two singles rounded to bfloat16 and packed into one word")
+    (formal (or i32 (fcvt_f2f bf16 f32 bn) (shl i32 (fcvt_f2f bf16 f32 bm) 16)))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 700.0) (power-estimate-mw 0.9) (expected-speedup 2.0)
+    (rationale "The packing a store does, which is where a wrong mask would show"))
+)

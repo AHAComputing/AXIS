@@ -1,0 +1,26 @@
+{
+  "schema": "axis.shared-backend.v1",
+  "config": {
+    "contexts": 2,
+    "units_total": 4,
+    "request_ports_total": 2,
+    "result_ports_total": 2,
+    "queue_depth_per_pool": 8,
+    "shared": true,
+    "input_delay": 0,
+    "output_delay": 0,
+    "pipelined": false
+  },
+  "streams": [
+    [
+      {"name": "vector_half", "latency": 3, "lanes": 2},
+      {"name": "vector_full", "latency": 3, "lanes": 4, "deps": ["vector_half"]}
+    ],
+    [
+      {"name": "scalar_0", "latency": 1},
+      {"name": "scalar_1", "latency": 1},
+      {"name": "scalar_2", "latency": 1},
+      {"name": "scalar_3", "latency": 1}
+    ]
+  ]
+}

@@ -1,0 +1,36 @@
+(axis-module xstore
+  (version "1.0")
+  (target rvmt)
+
+  (defisa rv32_store
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32")
+    (features m custom)
+    (memory-model rvwmo)
+    (endianness little)
+  )
+
+  (definstruction sw_x
+    (mnemonic SW_X)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 3)
+    (func7 16)
+    (encoding (rd 0))
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+    )
+    (asm "sw_x $rs2, ($rs1)")
+    (behavior
+      (store rs1 rs2 i32)
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+)

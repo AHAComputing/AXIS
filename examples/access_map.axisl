@@ -1,0 +1,131 @@
+; Affine access maps (docs/tensor_design.md, T5).
+;
+; A scalable load's address is a function of the lane, and stage S5 gave that
+; function three shapes: unit, strided and indexed. A tile wants a fourth --
+; rows at one stride, elements at another -- and an im2col window wants a fifth
+; with three dimensions. Writing one form per shape is how a vocabulary grows
+; without a mechanism, so this is the mechanism:
+;
+;   (vload_map <type> base (dim <extent> <stride>) ...)
+;   (vaddr_map <type> base (dim <extent> <stride>) ...)
+;
+; Dimensions are named outermost first, the way a subscript is written. Lane k
+; decomposes into one index per dimension and the offset is the sum of each
+; index times its stride.
+;
+; ⚠️ The extents are literals and the strides need not be, and that split is
+; the whole trick. The decomposition happens at elaboration, where the lane is
+; already a constant -- so every index is a number by the time it multiplies a
+; stride that may well be a register. AMX's TILELOADD reads rows at a runtime
+; stride and elements contiguously within them, which is `(dim 16 rs) (dim 16 4)`
+; and nothing else.
+;
+; The map SUBSUMES the forms beside it rather than joining them, and that is
+; what tools/access_map_check.py checks first: one dimension at the element
+; size must produce the same addresses as `vaddr`, and one at an operand stride
+; the same as `vaddr_strided`. Both of those were proven in S5, so the general
+; form is held to machinery that is already trusted rather than to a restated
+; version of itself.
+(axis-module access_map
+  (version "0.1.0")
+  (target rvmt)
+  (description "Affine access maps over a lane space")
+
+  (defisa maps
+    (base rv64im)
+    (word-bits 64)
+    (vector-bits 512)
+    (registers "z[16]:i512" "x[32]:i64" "pc:i64")
+    (features simd scalable custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat MAP_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (rs1 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction addr_unit
+    (mnemonic ADDR_UNIT) (isa maps) (category custom) (format MAP_R)
+    (opcode 11) (func3 0) (func7 0)
+    (encoding (rs2 0))
+    (operands (zd reg i64 out) (rs1 reg i64 in))
+    (asm "addr_unit $zd, $rs1")
+    (semantics "The unit-stride address function, from stage S5")
+    (formal (vaddr vni32 rs1))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 200.0) (power-estimate-mw 0.3) (expected-speedup 1.0)
+    (rationale "The special case the general form must reproduce"))
+
+  (definstruction addr_strided
+    (mnemonic ADDR_STRIDED) (isa maps) (category custom) (format MAP_R)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (zd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "addr_strided $zd, $rs1, $rs2")
+    (semantics "The strided address function, from stage S5")
+    (formal (vaddr_strided vni32 rs1 rs2))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 200.0) (power-estimate-mw 0.3) (expected-speedup 1.0)
+    (rationale "The other special case, whose stride is a register rather than a literal"))
+
+  (definstruction map_unit
+    (mnemonic MAP_UNIT) (isa maps) (category custom) (format MAP_R)
+    (opcode 11) (func3 2) (func7 0)
+    (encoding (rs2 0))
+    (operands (zd reg i64 out) (rs1 reg i64 in))
+    (asm "map_unit $zd, $rs1")
+    (semantics "One dimension at the element size, which is the unit stride said generally")
+    (formal (vaddr_map vni32 rs1 (dim 16 4)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 200.0) (power-estimate-mw 0.3) (expected-speedup 1.0)
+    (rationale "Must equal ADDR_UNIT, or the general form is not general"))
+
+  (definstruction map_strided
+    (mnemonic MAP_STRIDED) (isa maps) (category custom) (format MAP_R)
+    (opcode 11) (func3 3) (func7 0)
+    (operands (zd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "map_strided $zd, $rs1, $rs2")
+    (semantics "One dimension at a register stride")
+    (formal (vaddr_map vni32 rs1 (dim 16 rs2)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 200.0) (power-estimate-mw 0.3) (expected-speedup 1.0)
+    (rationale "Must equal ADDR_STRIDED for the same reason"))
+
+  (definstruction map_tile
+    (mnemonic MAP_TILE) (isa maps) (category custom) (format MAP_R)
+    (opcode 11) (func3 4) (func7 0)
+    (operands (zd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "map_tile $zd, $rs1, $rs2")
+    (semantics "Four rows at a register stride, four words contiguous within each")
+    (formal (vaddr_map vni32 rs1 (dim 4 rs2) (dim 4 4)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 300.0) (power-estimate-mw 0.4) (expected-speedup 1.0)
+    (rationale "AMX's TILELOADD, at the size a gate can enumerate by hand"))
+
+  (definstruction map_window
+    (mnemonic MAP_WINDOW) (isa maps) (category custom) (format MAP_R)
+    (opcode 11) (func3 5) (func7 0)
+    (operands (zd reg i64 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "map_window $zd, $rs1, $rs2")
+    (semantics "Three dimensions: rows at a register stride, then a fixed inner window")
+    (formal (vaddr_map vni32 rs1 (dim 2 rs2) (dim 2 32) (dim 4 4)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "An im2col window is a third dimension and no new mechanism"))
+
+  (definstruction tile_load
+    (mnemonic TILE_LOAD) (isa maps) (category custom) (format MAP_R)
+    (opcode 11) (func3 6) (func7 0)
+    (operands (zd reg i32 out) (rs1 reg i64 in) (rs2 reg i64 in))
+    (asm "tile_load $zd, $rs1, $rs2")
+    (semantics "The tile map as an actual load, so the executors touch it")
+    (behavior (set zd (vload_map vni32 rs1 (dim 4 rs2) (dim 4 4))))
+    (latency 8) (throughput 0.5)
+    (area-estimate-um2 1200.0) (power-estimate-mw 1.6) (expected-speedup 4.0)
+    (rationale "An address function is only worth having if something loads through it"))
+)

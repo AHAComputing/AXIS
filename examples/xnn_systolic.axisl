@@ -1,0 +1,189 @@
+;; H3: an MMIO device -- PCE's XNN systolic engine (docs/accelerator_design.md).
+;;
+;; pce hardware/accel_engines/xnn_systolic_engine.py, instantiated 4 x 4, int8
+;; into int32, M up to 8. The host streams weights and activations through
+;; registers, sets M, kicks, polls busy and streams results back:
+;;
+;;   0x00 W  weight stream      rows*cols weights, row-major W[k][n]
+;;   0x04 W  activation stream  M*rows activations, row-major A[m][k]
+;;   0x08 W  M                  activation rows, 1..8; anything else is an error
+;;   0x0C W  kick               run one K tile (below)
+;;   0x10 R  status             bit 0 busy, bit 1 sticky error, bit 2 K chain open
+;;   0x14 R  result stream      M*cols results, row-major R[m][n]
+;;   0x18 W  reset pointers     rewind the streams, and clear the sticky error
+;;   0x30 W  K-tile control     bit 0 accumulate, bit 1 more K, bits 31:16 valid K
+;;                              (0 = all rows; more than rows is an error)
+;;
+;; K larger than the array (H3b) is a CHAIN of K tiles: the first without
+;; accumulate, the rest with it, every one but the last with more-K; a short
+;; last tile sets valid K and its operands past it count as zero. Results
+;; ping-pong between two banks -- a tile reads the prior sums from one and
+;; writes to the other -- and a result read comes from the latest. A kick is
+;; refused, with the sticky error set, when it accumulates onto no open chain
+;; or onto one of a different M, or when the error is already set; a refused
+;; kick changes no result. Measured on the RTL before any of this was written.
+;;
+;; Each register's effect is an INSTRUCTION of the device's own ISA, run with
+;; the written value in x1 and the read value returned in x2, over a device-
+;; local memory that holds the engine's state:
+;;
+;;   0x000  weights  16 x i8        0x300 wptr   0x310 kctl   0x320 sel
+;;   0x100  acts     32 x i8        0x304 aptr   0x314 error
+;;   0x200  bank 0   32 x i32       0x308 rptr   0x318 open
+;;   0x280  bank 1   32 x i32       0x30C m      0x31C chain_m
+;;
+;; The engine takes cycles and reports busy; here a kick completes before the
+;; next access, so busy reads 0 -- a host that polls sees the same answers.
+;; What a register holds after a REJECTED write is not claimed: the gate's
+;; host rewrites M and K control after every error, as a host must.
+(axis-module xnn_systolic
+  (version "0.1.0")
+  (target rvmt)
+  (description "PCE's XNN systolic GEMM engine, as its MMIO registers' effects")
+
+  (defisa xnn_dev
+    (base rv64im) (word-bits 64) (registers "x[32]:i64" "pc:i64")
+    (features custom) (memory-model rvwmo) (endianness little))
+
+  (defformat XNN_H
+    (bits 32)
+    (fields (opcode 6 0) (rd 11 7) (func3 14 12) (rs1 19 15) (rs2 24 20) (func7 31 25)))
+
+  (definstruction xnn_w_weight
+    (mnemonic XNN_W_WEIGHT) (isa xnn_dev) (category custom) (format XNN_H)
+    (opcode 11) (func3 0) (func7 0)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 reg32 i32 in))
+    (asm "xnn_w_weight")
+    (semantics "weights[wptr++] = value")
+    (behavior
+      (store (add i64 0 (zext i64 32 (load i32 unsigned 768))) rs1 i8)
+      (store 768 (add i32 (load i32 unsigned 768) 1) i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "One MMIO register of the XNN systolic engine"))
+
+  (definstruction xnn_w_act
+    (mnemonic XNN_W_ACT) (isa xnn_dev) (category custom) (format XNN_H)
+    (opcode 11) (func3 1) (func7 0)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 reg32 i32 in))
+    (asm "xnn_w_act")
+    (semantics "acts[aptr++] = value")
+    (behavior
+      (store (add i64 256 (zext i64 32 (load i32 unsigned 772))) rs1 i8)
+      (store 772 (add i32 (load i32 unsigned 772) 1) i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "One MMIO register of the XNN systolic engine"))
+
+  (definstruction xnn_w_m
+    (mnemonic XNN_W_M) (isa xnn_dev) (category custom) (format XNN_H)
+    (opcode 11) (func3 2) (func7 0)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 reg32 i32 in))
+    (asm "xnn_w_m")
+    (semantics "M = value, if 1..8; else the sticky error")
+    (behavior
+      (when (and (ne rs1 0) (ult rs1 9)) (store 780 rs1 i32))
+      (when (or (eq rs1 0) (uge rs1 9)) (store 788 1 i32)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "One MMIO register of the XNN systolic engine"))
+
+  (definstruction xnn_w_kick
+    (mnemonic XNN_W_KICK) (isa xnn_dev) (category custom) (format XNN_H)
+    (opcode 11) (func3 3) (func7 0)
+    (encoding (rd 0) (rs1 0) (rs2 0))
+    (operands )
+    (asm "xnn_w_kick")
+    (semantics "one K tile: into the other bank, onto the prior sums if accumulating; refused with the sticky error otherwise")
+    (behavior
+      (iterate (m 8)
+        (iterate (n 4)
+          (when (and (and (eq (load i32 unsigned 788) 0) (or (eq (and i32 (load i32 unsigned 784) 1) 0) (and (eq (load i32 unsigned 792) 1) (eq (load i32 unsigned 780) (load i32 unsigned 796))))) (ult m (load i32 unsigned 780)))
+            (store (add i64 512 (add i64 (mul i64 (zext i64 32 (xor i32 (load i32 unsigned 800) 1)) 128) (mul i64 (add i64 (mul i64 m 4) n) 4)))
+                   (add i32 (accumulate i32 add (k 4) (order sequential)
+                              (select i32 (icmp_ult k (select i32 (icmp_eq (lshr i32 (load i32 unsigned 784) 16) 0) 4 (lshr i32 (load i32 unsigned 784) 16)))
+                   (mul i32 (sext i32 8 (load i8 unsigned (add i64 256 (add i64 (mul i64 m 4) k))))
+                            (sext i32 8 (load i8 unsigned (add i64 (mul i64 k 4) n))))
+                   0))
+                            (select i32 (icmp_ne (and i32 (load i32 unsigned 784) 1) 0) (load i32 unsigned (add i64 512 (add i64 (mul i64 (zext i64 32 (load i32 unsigned 800)) 128) (mul i64 (add i64 (mul i64 m 4) n) 4)))) 0))
+                   i32))))
+      (store 788 (select i32 (icmp_ne (select i32 (icmp_ne (load i32 unsigned 788) 0) 0 (select i32 (icmp_eq (and i32 (load i32 unsigned 784) 1) 0) 1 (select i32 (icmp_eq (load i32 unsigned 792) 1) (select i32 (icmp_eq (load i32 unsigned 780) (load i32 unsigned 796)) 1 0) 0))) 0) (load i32 unsigned 788) 1) i32)
+      (when (and (eq (load i32 unsigned 788) 0) (or (eq (and i32 (load i32 unsigned 784) 1) 0) (and (eq (load i32 unsigned 792) 1) (eq (load i32 unsigned 780) (load i32 unsigned 796))))) (store 796 (load i32 unsigned 780) i32))
+      (when (and (eq (load i32 unsigned 788) 0) (or (eq (and i32 (load i32 unsigned 784) 1) 0) (and (eq (load i32 unsigned 792) 1) (eq (load i32 unsigned 780) (load i32 unsigned 796))))) (store 800 (xor i32 (load i32 unsigned 800) 1) i32))
+      (when (and (eq (load i32 unsigned 788) 0) (or (eq (and i32 (load i32 unsigned 784) 1) 0) (and (eq (load i32 unsigned 792) 1) (eq (load i32 unsigned 780) (load i32 unsigned 796))))) (store 792 (and i32 (lshr i32 (load i32 unsigned 784) 1) 1) i32)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "One MMIO register of the XNN systolic engine"))
+
+  (definstruction xnn_r_status
+    (mnemonic XNN_R_STATUS) (isa xnn_dev) (category custom) (format XNN_H)
+    (opcode 11) (func3 4) (func7 0)
+    (encoding (rs1 0) (rs2 0))
+    (operands (rd reg32 i32 out))
+    (asm "xnn_r_status")
+    (semantics "error in bit 1, chain open in bit 2; busy never")
+    (behavior (set rd (or i32 (shl i32 (load i32 unsigned 788) 1) (shl i32 (load i32 unsigned 792) 2))))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "One MMIO register of the XNN systolic engine"))
+
+  (definstruction xnn_r_result
+    (mnemonic XNN_R_RESULT) (isa xnn_dev) (category custom) (format XNN_H)
+    (opcode 11) (func3 5) (func7 0)
+    (encoding (rs1 0) (rs2 0))
+    (operands (rd reg32 i32 out))
+    (asm "xnn_r_result")
+    (semantics "value = latest bank[rptr++]")
+    (behavior
+      (set rd (load i32 unsigned (add i64 512 (add i64 (mul i64 (zext i64 32 (load i32 unsigned 800)) 128) (mul i64 (zext i64 32 (load i32 unsigned 776)) 4)))))
+      (store 776 (add i32 (load i32 unsigned 776) 1) i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "One MMIO register of the XNN systolic engine"))
+
+  (definstruction xnn_w_reset
+    (mnemonic XNN_W_RESET) (isa xnn_dev) (category custom) (format XNN_H)
+    (opcode 11) (func3 6) (func7 0)
+    (encoding (rd 0) (rs1 0) (rs2 0))
+    (operands )
+    (asm "xnn_w_reset")
+    (semantics "wptr = aptr = rptr = 0; error = 0")
+    (behavior
+      (store 768 0 i32)
+      (store 772 0 i32)
+      (store 776 0 i32)
+      (store 788 0 i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "One MMIO register of the XNN systolic engine"))
+
+  (definstruction xnn_w_kctl
+    (mnemonic XNN_W_KCTL) (isa xnn_dev) (category custom) (format XNN_H)
+    (opcode 11) (func3 7) (func7 0)
+    (encoding (rd 0) (rs2 0))
+    (operands (rs1 reg32 i32 in))
+    (asm "xnn_w_kctl")
+    (semantics "K-tile control = value, if valid K <= rows; else the sticky error")
+    (behavior
+      (when (ult (lshr i32 rs1 16) 5) (store 784 rs1 i32))
+      (when (uge (lshr i32 rs1 16) 5) (store 788 1 i32)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "One MMIO register of the XNN systolic engine"))
+
+  ; The register map: which handler runs when the host touches which word.
+  (defdevice xnn_systolic
+    (isa xnn_dev)
+    (window 0x1000)
+    (register 0x00 write xnn_w_weight)
+    (register 0x04 write xnn_w_act)
+    (register 0x08 write xnn_w_m)
+    (register 0x0c write xnn_w_kick)
+    (register 0x10 read xnn_r_status)
+    (register 0x14 read xnn_r_result)
+    (register 0x18 write xnn_w_reset)
+    (register 0x30 write xnn_w_kctl)
+    (description "PCE XNN systolic engine, 4 x 4 int8 -> int32, M up to 8, K chained in tiles")))

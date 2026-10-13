@@ -1,0 +1,137 @@
+; Lane-wise integer SIMD on 64-bit vector registers (stage V1 of
+; docs/simd_fp_design.md). These are the AArch64 NEON D-register shapes:
+; a 64-bit register read as 2x32, 4x16, or 8x8 lanes. The vector type atom
+; `v<lanes>i<elem>` sets both the register width and the lane width, and
+; src/ir.rs expands the operator per lane, so the golden model, SMT, and LLVM
+; prove these with no backend changes.
+(axis-module simd_lanes
+  (version "0.1.0")
+  (target rvmt)
+  (description "Lane-wise integer SIMD over 64-bit vector registers")
+
+  (defisa simd64
+    (base rv64im)
+    (word-bits 64)
+    (registers "v[32]:i64" "pc:i64")
+    (features simd custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat SIMD_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (vn 19 15)
+      (vm 24 20)
+      (func7 31 25)))
+
+  ; --- 2 x 32-bit lanes -------------------------------------------------
+  (definstruction vadd_2s
+    (mnemonic VADD_2S) (isa simd64) (category simd) (format SIMD_R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "vadd.2s $vd, $vn, $vm")
+    (semantics "Add two 32-bit lanes; carry does not cross the lane boundary")
+    (formal (add v2i32 vn vm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Lane-wise add is the smallest instruction that distinguishes a vector from a wide scalar."))
+
+  (definstruction vsub_2s
+    (mnemonic VSUB_2S) (isa simd64) (category simd) (format SIMD_R)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "vsub.2s $vd, $vn, $vm")
+    (semantics "Subtract two 32-bit lanes; borrow does not cross the lane boundary")
+    (formal (sub v2i32 vn vm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Borrow containment is the mirror of carry containment."))
+
+  (definstruction vmul_2s
+    (mnemonic VMUL_2S) (isa simd64) (category simd) (format SIMD_R)
+    (opcode 11) (func3 2) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "vmul.2s $vd, $vn, $vm")
+    (semantics "Multiply two 32-bit lanes, keeping the low half of each product")
+    (formal (mul v2i32 vn vm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 4000.0) (power-estimate-mw 5.0) (expected-speedup 2.0)
+    (rationale "The truncating product is where an unmasked lane would visibly overflow into its neighbour."))
+
+  ; --- 4 x 16-bit lanes -------------------------------------------------
+  (definstruction vadd_4h
+    (mnemonic VADD_4H) (isa simd64) (category simd) (format SIMD_R)
+    (opcode 11) (func3 3) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "vadd.4h $vd, $vn, $vm")
+    (semantics "Add four 16-bit lanes")
+    (formal (add v4i16 vn vm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 4.0)
+    (rationale "Narrower lanes multiply the number of boundaries the masking has to hold."))
+
+  (definstruction vmaxs_4h
+    (mnemonic VMAXS_4H) (isa simd64) (category simd) (format SIMD_R)
+    (opcode 11) (func3 4) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "vmaxs.4h $vd, $vn, $vm")
+    (semantics "Signed maximum of four 16-bit lanes")
+    (formal (max v4i16 vn vm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.2) (expected-speedup 4.0)
+    (rationale "Signed comparison must read each lane's own sign bit, not the register's."))
+
+  ; --- 8 x 8-bit lanes --------------------------------------------------
+  (definstruction vadd_8b
+    (mnemonic VADD_8B) (isa simd64) (category simd) (format SIMD_R)
+    (opcode 11) (func3 5) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "vadd.8b $vd, $vn, $vm")
+    (semantics "Add eight 8-bit lanes")
+    (formal (add v8i8 vn vm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 8.0)
+    (rationale "Eight lanes in one register is the densest packing a 64-bit vector allows."))
+
+  (definstruction vminu_8b
+    (mnemonic VMINU_8B) (isa simd64) (category simd) (format SIMD_R)
+    (opcode 11) (func3 6) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "vminu.8b $vd, $vn, $vm")
+    (semantics "Unsigned minimum of eight 8-bit lanes")
+    (formal (minu v8i8 vn vm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.2) (expected-speedup 8.0)
+    (rationale "Unsigned compare per lane, distinct from the signed form above."))
+
+  (definstruction vand_8b
+    (mnemonic VAND_8B) (isa simd64) (category simd) (format SIMD_R)
+    (opcode 11) (func3 7) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "vand.8b $vd, $vn, $vm")
+    (semantics "Bitwise and; lane-independent, so the lane shape does not change the result")
+    (formal (and v8i8 vn vm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.0) (expected-speedup 8.0)
+    (rationale "A lane-independent operator: proving it equals the scalar form checks the expansion adds no error."))
+  ; The companion witness to VMAXS_4H. A lane-wise arithmetic shift is
+  ; width-sensitive the same way a signed compare is -- it reads the lane's own
+  ; sign bit -- but it survives for a different reason: `(ashr i16 ...)` states
+  ; the width it runs at, where a comparison rendered as `(icmp_slt i1 ...)`
+  ; states only that it yields a bit. This pins the annotation that makes it
+  ; work, so a backend that typed shifts by the register's width instead would
+  ; be caught here rather than in whatever consumed it.
+  (definstruction vsra_4h
+    (mnemonic VSRA_4H) (isa simd64) (category simd) (format SIMD_R)
+    (opcode 11) (func3 6) (func7 3)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "vsra.4h $vd, $vn, $vm")
+    (semantics "Arithmetic shift right of four 16-bit lanes")
+    (formal (sra v4i16 vn vm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1800.0) (power-estimate-mw 2.2) (expected-speedup 4.0)
+    (rationale "Each lane shifts by its own amount and fills with its own sign."))
+)

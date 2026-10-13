@@ -1,0 +1,11 @@
+; A plan AXIS would not choose: the multiplier and the divider as ONE unit,
+; sharing whatever legally can be. They have no operator in common, so this
+; is larger than keeping them apart -- and it computes exactly the same, which
+; is what the gate that names this file checks.
+(hw-plan
+  (unit alu (sharing when-it-pays)
+    (members LUI ADDI SLTI SLTIU XORI ORI ANDI SLLI SRLI SRAI ADD SUB SLL SLT SLTU XOR SRL SRA OR AND FMV_X_W FMV_W_X FSGNJ_S FSGNJN_S FSGNJX_S FSGNJ_D FSGNJN_D FSGNJX_D))
+  (unit alu_l2 (sharing when-it-pays)
+    (members FCLASS_S FCLASS_D))
+  (unit muldiv (sharing always)
+    (members MUL MULH MULHSU MULHU DIV DIVU REM REMU)))

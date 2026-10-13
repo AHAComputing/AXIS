@@ -1,0 +1,71 @@
+(axis-module xbranch
+  (version "1.0")
+  (target rvmt)
+
+  (defisa rv32_branch
+    (base rv32im)
+    (word-bits 32)
+    ; `last_target` is a state slot an indirect branch writes beside the
+    ; counter -- a branch-target record, which is a real thing a machine keeps
+    ; and, here, the reason the wide executor runs `JR_X` at all: the wide
+    ; driver leaves a narrow instruction to the compact one unless it touches
+    ; architectural state, and a bare-register branch target is the one shape
+    ; where the counter's own width is what decides the answer.
+    (registers "x[32]:i32" "last_target:i32")
+    (features m custom)
+    (memory-model rvwmo)
+    (endianness little)
+  )
+
+  (definstruction beq_x
+    (mnemonic BEQ_X)
+    (category custom)
+    (format B)
+    (opcode 11)
+    (func3 0)
+    (func7 0)
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (imm imm i13 in)
+    )
+    (asm "beq_x $rs1, $rs2, $imm")
+    (behavior
+      (when (icmp_eq rs1 rs2) (setpc (add pc imm)))
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+
+  ; A branch target that is a register and nothing else. Every other `setpc` in
+  ; every corpus is arithmetic -- `(add pc imm)`, `(and (add rs1 imm) ~1)` --
+  ; and an operator masks its own result, so the rule that a program counter is
+  ; a value of the ISA word was never tested against an expression that does no
+  ; arithmetic at all. This is that expression, on a 32-bit machine, where the
+  ; register it reads is held in a 64-bit slot.
+  (definstruction jr_x
+    (mnemonic JR_X)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 1)
+    (func7 0)
+    (encoding (rd 0) (rs2 0))
+    (operands
+      (rs1 reg i32 in)
+    )
+    (asm "jr_x $rs1")
+    (behavior
+      (setstate last_target rs1 i32)
+      (setpc rs1)
+    )
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+  )
+)

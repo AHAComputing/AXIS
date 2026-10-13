@@ -1,0 +1,184 @@
+; AArch64's floating-point environment: FPCR drives the rounding, FPSR accrues
+; what was raised. Stage F3 for a second ISA.
+;
+; The seed corpus declares FPCR and FPSR and gives `MRS`/`MSR` to read and write
+; them, and contains no floating-point arithmetic at all -- a mode register
+; nothing consults and a flag register nothing sets, which is the state RISC-V
+; was in before Zicsr. This corpus closes that loop on the two registers rather
+; than on the 544-instruction translation seed, because the question here is the
+; environment, not the encodings.
+;
+; It is also the measurement of whether the F3 design is ISA-portable or merely
+; RISC-V-shaped, and the two halves answer differently.
+;
+; The rounding mode ports for free. `_rm` takes the mode as an ordinary integer
+; expression, and the encoding it takes is the one AArch64 uses -- 00 nearest,
+; 01 toward +infinity, 10 toward -infinity, 11 toward zero -- so `FPCR.RMode`
+; reaches the operator through `(and (lshr fpcr 22) 3)` and nothing else. RISC-V
+; is the ISA that maps: its RTZ is 1 and it passes 3.
+;
+; And AArch64's field is two bits wide, so every value of it names a mode. RISC-V's
+; is three and two of the eight are reserved, which is why its DYN instructions
+; carry a trap arm and these do not. The difference is in the ISAs, and a
+; description that has to state a trap only where one exists is the description
+; working.
+;
+; The exception word does *not* port for free. `_fx` returns RISC-V's `fflags`
+; order -- invalid at bit 4 down to inexact at bit 0 -- and AArch64's FPSR is
+; that order reversed: IOC at bit 0 up to IXC at bit 4. Nothing in the language
+; knows this; `a64_fpsr_bits` below is an ordinary expression over operators
+; that already existed, which is the same argument the mode makes, arrived at
+; from the other direction.
+(axis-module aarch64_fp_env
+  (version "1.0.0")
+  (target rvmt)
+  (description "FPCR-driven rounding and FPSR exception accumulation")
+
+  (defisa a64fp
+    (base rv64im)
+    (word-bits 64)
+    (registers "v[32]:i64" "x[32]:i64" "pc:i64" "fpcr:i32" "fpsr:i32")
+    (features fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat A64_FP
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (vd 11 7)
+      (func3 14 12)
+      (vn 19 15)
+      (vm 24 20)
+      (func7 31 25)))
+
+  ; FPCR.RMode, bits 23:22, in the encoding `_rm` already takes.
+  (defsem a64_rmode ((fpcr i32)) i32
+    (and i32 (lshr i32 fpcr 22) 3))
+
+  ; The exception word, from `fflags` order into FPSR's. Invalid is the top bit
+  ; of one and the bottom bit of the other, so this is a five-bit reversal;
+  ; overflow sits in the middle and is the only one that does not move.
+  (defsem a64_fpsr_bits ((flags i32)) i32
+    (or i32
+      (and i32 (lshr i32 flags 4) 1)
+      (or i32
+        (shl i32 (and i32 (lshr i32 flags 3) 1) 1)
+        (or i32
+          (shl i32 (and i32 (lshr i32 flags 2) 1) 2)
+          (or i32
+            (shl i32 (and i32 (lshr i32 flags 1) 1) 3)
+            (shl i32 (and i32 flags 1) 4))))))
+
+  (definstruction a64_fadd_d
+    (mnemonic A64_FADD_D) (isa a64fp) (category float) (format A64_FP)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "fadd $vd, $vn, $vm")
+    (semantics "Double add in FPCR's direction, accruing FPSR")
+    (behavior
+      (set vd (fadd_rm f64 (a64_rmode fpcr) vn vm))
+      (setstate fpsr (or i32 fpsr (a64_fpsr_bits (fadd_fx f64 vn vm))) i32))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 8000.0) (power-estimate-mw 9.0) (expected-speedup 1.0)
+    (rationale "The witness that a mode register is read and a flag register written"))
+
+  (definstruction a64_fsub_d
+    (mnemonic A64_FSUB_D) (isa a64fp) (category float) (format A64_FP)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "fsub $vd, $vn, $vm")
+    (semantics "Double subtract in FPCR's direction, accruing FPSR")
+    (behavior
+      (set vd (fsub_rm f64 (a64_rmode fpcr) vn vm))
+      (setstate fpsr (or i32 fpsr (a64_fpsr_bits (fsub_fx f64 vn vm))) i32))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 8000.0) (power-estimate-mw 9.0) (expected-speedup 1.0)
+    (rationale "Infinity minus itself, which is where invalid reaches IOC"))
+
+  (definstruction a64_fmul_d
+    (mnemonic A64_FMUL_D) (isa a64fp) (category float) (format A64_FP)
+    (opcode 11) (func3 2) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "fmul $vd, $vn, $vm")
+    (semantics "Double multiply in FPCR's direction, accruing FPSR")
+    (behavior
+      (set vd (fmul_rm f64 (a64_rmode fpcr) vn vm))
+      (setstate fpsr (or i32 fpsr (a64_fpsr_bits (fmul_fx f64 vn vm))) i32))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 8000.0) (power-estimate-mw 9.0) (expected-speedup 1.0)
+    (rationale "Overflow and underflow, which sit either side of the reversal"))
+
+  (definstruction a64_fdiv_d
+    (mnemonic A64_FDIV_D) (isa a64fp) (category float) (format A64_FP)
+    (opcode 11) (func3 3) (func7 0)
+    (operands (vd reg i64 out) (vn reg i64 in) (vm reg i64 in))
+    (asm "fdiv $vd, $vn, $vm")
+    (semantics "Double divide in FPCR's direction, accruing FPSR")
+    (behavior
+      (set vd (fdiv_rm f64 (a64_rmode fpcr) vn vm))
+      (setstate fpsr (or i32 fpsr (a64_fpsr_bits (fdiv_fx f64 vn vm))) i32))
+    (latency 8) (throughput 0.5)
+    (area-estimate-um2 12000.0) (power-estimate-mw 14.0) (expected-speedup 1.0)
+    (rationale "The only operation that reaches DZC"))
+
+  (definstruction a64_fsqrt_d
+    (mnemonic A64_FSQRT_D) (isa a64fp) (category float) (format A64_FP)
+    (opcode 11) (func3 4) (func7 0) (encoding (vm 0))
+    (operands (vd reg i64 out) (vn reg i64 in))
+    (asm "fsqrt $vd, $vn")
+    (semantics "Double square root in FPCR's direction, accruing FPSR")
+    (behavior
+      (set vd (fsqrt_rm f64 (a64_rmode fpcr) vn))
+      (setstate fpsr (or i32 fpsr (a64_fpsr_bits (fsqrt_fx f64 vn))) i32))
+    (latency 12) (throughput 0.25)
+    (area-estimate-um2 16000.0) (power-estimate-mw 18.0) (expected-speedup 1.0)
+    (rationale "Invalid from a negative operand, with no second operand to blame"))
+
+  (definstruction a64_mrs_fpcr
+    (mnemonic A64_MRS_FPCR) (isa a64fp) (category custom) (format A64_FP)
+    (opcode 11) (func3 5) (func7 0) (encoding (vn 0) (vm 0))
+    (operands (vd reg i64 out))
+    (asm "mrs $vd, fpcr")
+    (semantics "Read the control register")
+    (behavior
+      (set vd (zext i64 32 fpcr)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 100.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "A mode register is only a mode register if something can read it"))
+
+  (definstruction a64_msr_fpcr
+    (mnemonic A64_MSR_FPCR) (isa a64fp) (category custom) (format A64_FP)
+    (opcode 11) (func3 6) (func7 0) (encoding (vd 0) (vm 0))
+    (operands (vn reg i64 in))
+    (asm "msr fpcr, $vn")
+    (semantics "Write the control register")
+    (behavior
+      (setstate fpcr (and i32 vn 0xffffffff) i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 100.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "And only a control register if something can set it"))
+
+  (definstruction a64_mrs_fpsr
+    (mnemonic A64_MRS_FPSR) (isa a64fp) (category custom) (format A64_FP)
+    (opcode 11) (func3 7) (func7 0) (encoding (vn 0) (vm 0))
+    (operands (vd reg i64 out))
+    (asm "mrs $vd, fpsr")
+    (semantics "Read the status register")
+    (behavior
+      (set vd (zext i64 32 fpsr)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 100.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Accrued flags no one can read are not observable"))
+
+  (definstruction a64_msr_fpsr
+    (mnemonic A64_MSR_FPSR) (isa a64fp) (category custom) (format A64_FP)
+    (opcode 11) (func3 0) (func7 1) (encoding (vd 0) (vm 0))
+    (operands (vn reg i64 in))
+    (asm "msr fpsr, $vn")
+    (semantics "Write the status register, which is how flags are cleared")
+    (behavior
+      (setstate fpsr (and i32 vn 0xffffffff) i32))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 100.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Arithmetic only sets bits; clearing them is a write")))

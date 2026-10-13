@@ -1,0 +1,266 @@
+; A memory system, described once (docs/memory_system_design.md).
+;
+; Two cores, each with a private L1 data cache; one shared L2 that is also the
+; coherence home, holding the directory; one DDR5 channel behind it; and a
+; scratchpad outside coherence. All of them sit on a 3x3 mesh, and every
+; number a consumer needs -- geometry, policy, timing, placement, which level a
+; miss goes to, which node an address belongs to -- is written here and only
+; here.
+;
+; ⚠️ Nothing below is for one consumer. The pack's simulator times programs
+; against this system, and AHA's NoC and CHI generators build the memory
+; fabric and the coherent fabric from the `axis.memsys.v1` manifest this
+; description emits (`emit-memsys-json`). A number stated for one of them
+; that the others did not read would be free text, which is the failure
+; `expected-speedup` has on every instruction nobody measures.
+(axis-module memsys
+  (version "1.0")
+  (target rvmt)
+  (description "Two cores, private L1s, a shared coherent L2, DDR5 and a scratchpad on a 3x3 mesh")
+
+  (defisa ms64
+    (base rv64i)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64")
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; ---- what each memory is ------------------------------------------------------
+
+  ; A small, 4-way L1: 4 KiB is sixteen sets, so a program can fill it, and a
+  ; test can tell LRU from FIFO, in a few hundred accesses.
+  (defmemory l1d
+    (kind cache)
+    (size-bytes 4096)
+    (line-bytes 64)
+    (ways 4)
+    (width-bits 64)
+    (latency-cycles 2)
+    (replacement lru)
+    (write-policy write-back)
+    (allocate write-allocate)
+    (mshrs 4))
+
+  ; The shared level, inclusive of both L1s: a line an L1 holds is in the L2,
+  ; which is what lets the L2's directory answer for it.
+  (defmemory l2
+    (kind cache)
+    (size-bytes 65536)
+    (line-bytes 64)
+    (ways 8)
+    (width-bits 64)
+    (latency-cycles 12)
+    (replacement plru)
+    (write-policy write-back)
+    (allocate write-allocate)
+    (mshrs 16)
+    (inclusion inclusive)
+    (prefetch next-line)
+    (prefetch-degree 1))
+
+  ; DDR5-4800 (CL40-39-39): tCK 0.4167 ns, and tRAS 32 ns is 77 cycles of it.
+  ; The standard is named so a consumer with its own profile of the part can be
+  ; held to the same numbers; the numbers are written so one without can run.
+  (defmemory ddr
+    (kind dram)
+    (size-bytes 0x80000000)
+    (width-bits 64)
+    (banks 32)
+    (latency-cycles 1)
+    (standard ddr5-4800)
+    (channels 1)
+    (ranks 1)
+    (row-bytes 8192)
+    (page-policy open)
+    (timing (tck-ps 417) (tcl 40) (trcd 39) (trp 39) (tras 77)))
+
+  (defmemory spm
+    (kind scratchpad)
+    (size-bytes 65536)
+    (width-bits 64)
+    (banks 4)
+    (latency-cycles 1))
+
+  ; ---- the fabric between them ---------------------------------------------------
+
+  (definterconnect mesh3
+    (topology mesh (rows 3) (cols 3))
+    (virtual-channels 2)
+    (buffer-depth 4)
+    (flit-bits 64)
+    (address-bits 48)
+    (hop-cycles 1)
+    (router-cycles 1))
+
+  ; ---- the machine ----------------------------------------------------------------
+
+  (defcore cpu0
+    (kind rvmt)
+    (implements ms64)
+    (issue-width 1)
+    (units
+      (alu (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))
+      (br (count 1) (pipelined true))))
+
+  (defcore cpu1
+    (kind rvmt)
+    (implements ms64)
+    (issue-width 1)
+    (units
+      (alu (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))
+      (br (count 1) (pipelined true))))
+
+  ; `cpu0`'s twin, in NO memory system: the same width, the same units, so
+  ; a program's cycles on the two differ by exactly what the memory system
+  ; charged -- which is how the simulator's charge is held to the model's.
+  (defcore solo
+    (kind rvmt)
+    (implements ms64)
+    (issue-width 1)
+    (units
+      (alu (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))
+      (br (count 1) (pipelined true))))
+
+  ; The home sits at the centre of the mesh, where the hop count to it is
+  ; smallest from every corner -- and where AHA's CHI topology places a home it
+  ; is not told about, so the two agree by construction rather than by luck.
+  (defmemsys cluster
+    ; A 3 GHz core: every `*-cycles` above counts its 333 ps, and the DDR5's
+    ; 417 ps cycles are converted through it.
+    (clock-ps 333)
+    (interconnect mesh3)
+    (coherence
+      (protocol moesi)
+      (credit-depth 4)
+      (txn-id-bits 8)
+      (node-id-bits 7)
+      (table-depth 4)
+      (features retry qos))
+    (nodes
+      (c0-l1d (memory l1d) (core cpu0) (at 0 0) (next l2))
+      (c1-l1d (memory l1d) (core cpu1) (at 2 0) (next l2))
+      (l2 (memory l2) (at 1 1) (next ddr0) (home))
+      (ddr0 (memory ddr) (at 1 2))
+      (spm0 (memory spm) (at 0 2)))
+    (address-map
+      (region 0x0 0x80000000 ddr0 (home l2))
+      (region 0x80000000 0x10000 spm0 (uncached))))
+
+  ; ---- enough of an instruction set to run a program against it -------------------
+
+  (definstruction ADDI
+    (mnemonic ADDI)
+    (isa ms64)
+    (category custom)
+    (format I)
+    (opcode 0x13)
+    (func3 0)
+    (operands
+      (rd rv_gpr i64 out)
+      (rs1 rv_gpr i64 in)
+      (imm imm i64 in))
+    (asm "addi $rd, $rs1, $imm")
+    (semantics "Add the sign-extended immediate")
+    (formal (add i64 rs1 (sext i64 12 imm)))
+    (unit alu)
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Addresses and counters"))
+
+  (definstruction ADD
+    (mnemonic ADD)
+    (isa ms64)
+    (category custom)
+    (format R)
+    (opcode 0x33)
+    (func3 0)
+    (func7 0x00)
+    (operands
+      (rd rv_gpr i64 out)
+      (rs1 rv_gpr i64 in)
+      (rs2 rv_gpr i64 in))
+    (asm "add $rd, $rs1, $rs2")
+    (semantics "Add")
+    (formal (add i64 rs1 rs2))
+    (unit alu)
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Accumulate what was loaded"))
+
+  (definstruction LD
+    (mnemonic LD)
+    (isa ms64)
+    (category custom)
+    (format I)
+    (opcode 0x03)
+    (func3 3)
+    (operands
+      (rd rv_gpr i64 out)
+      (rs1 rv_gpr i64 in)
+      (imm imm i32 in))
+    (asm "ld $rd, $imm($rs1)")
+    (semantics "Load a full 64-bit doubleword")
+    (behavior
+      (set rd (load i64 signed (add i64 rs1 (sext i64 12 imm)))))
+    (unit lsu)
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "A read the memory system serves"))
+
+  (definstruction SD
+    (mnemonic SD)
+    (isa ms64)
+    (category custom)
+    (format S)
+    (opcode 0x23)
+    (func3 3)
+    (operands
+      (rs1 rv_gpr i64 in)
+      (rs2 rv_gpr i64 in)
+      (imm imm i32 in))
+    (asm "sd $rs2, $imm($rs1)")
+    (semantics "Store a full 64-bit doubleword")
+    (behavior
+      (store (add i64 rs1 (sext i64 12 imm)) rs2 i64))
+    (unit lsu)
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "A write the memory system serves, and the one coherence exists for"))
+
+  (definstruction BNE
+    (mnemonic BNE)
+    (isa ms64)
+    (category custom)
+    (format B)
+    (opcode 0x63)
+    (func3 1)
+    (operands
+      (rs1 rv_gpr i64 in)
+      (rs2 rv_gpr i64 in)
+      (imm imm i64 in))
+    (asm "bne $rs1, $rs2, $imm")
+    (semantics "Branch when rs1 is not equal rs2")
+    (behavior
+      (when (icmp_ne rs1 rs2) (setpc (add i64 pc (sext i64 13 imm)))))
+    (unit br)
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "The loop a working set is swept by")))

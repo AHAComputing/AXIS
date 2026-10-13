@@ -1,0 +1,173 @@
+; A four-slot VLIW machine: the packet decides when its syllables issue, and
+; the instructions decide what they mean (docs/vliw_spatial_design.md, B1).
+;
+; The slots are deliberately not interchangeable. `mem` is held by slot 0 alone
+; and `br` by slot 3 alone, so VSTW and VBRZ may carry the *same* 32-bit word:
+; nothing decodes both, because the decoder reaching them is reading different
+; syllable positions. Two slots reach memory, which is what makes a store in one
+; slot and a load in another a thing a packet can say. That is the encoding-space payoff slots buy, and it is
+; the same shape disjoint modes already buy in examples/mode_polymorphic.axis.
+(axis-module xvliw
+  (version "1.0")
+  (target rvmt)
+  (description "Four-slot VLIW packet with unit-typed slots")
+
+  (defisa lx32
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defpacket lx128
+    (isa lx32)
+    (slots
+      (s0 (width 32) (units alu mem))
+      (s1 (width 32) (units alu mem))
+      (s2 (width 32) (units alu mul))
+      (s3 (width 32) (units br)))
+    (order little)
+    (end fixed)
+    (hazards interlocked)
+    (branches at-most-one)
+    (description "Four 32-bit syllables: two memory-capable, one branch"))
+
+  (definstruction vadd
+    (mnemonic VADD)
+    (isa lx32)
+    (category custom)
+    (unit alu)
+    (format R)
+    (opcode 11)
+    (func3 0)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "vadd $rd, $rs1, $rs2")
+    (semantics "Add two registers in any compute slot")
+    (formal (add i32 rs1 rs2))
+    (latency 1)
+    (rationale "Any of the three compute slots issues it"))
+
+  (definstruction vsub
+    (mnemonic VSUB)
+    (isa lx32)
+    (category custom)
+    (unit alu)
+    (format R)
+    (opcode 11)
+    (func3 1)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "vsub $rd, $rs1, $rs2")
+    (semantics "Subtract two registers in any compute slot")
+    (formal (sub i32 rs1 rs2))
+    (latency 1)
+    (rationale "Any of the three compute slots issues it"))
+
+  (definstruction vand
+    (mnemonic VAND)
+    (isa lx32)
+    (category custom)
+    (unit alu)
+    (format R)
+    (opcode 11)
+    (func3 2)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "vand $rd, $rs1, $rs2")
+    (semantics "Bitwise and of two registers in any compute slot")
+    (formal (and i32 rs1 rs2))
+    (latency 1)
+    (rationale "Any of the three compute slots issues it"))
+
+  (definstruction vmul
+    (mnemonic VMUL)
+    (isa lx32)
+    (category custom)
+    (unit mul)
+    (format R)
+    (opcode 11)
+    (func3 3)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "vmul $rd, $rs1, $rs2")
+    (semantics "Multiply two registers in the multiplier slot")
+    (formal (mul i32 rs1 rs2))
+    (latency 3)
+    (rationale "Only slot 2 has a multiplier"))
+
+  (definstruction vldw
+    (mnemonic VLDW)
+    (isa lx32)
+    (category custom)
+    (unit mem)
+    (format I)
+    (opcode 11)
+    (func3 4)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (imm imm i12 in))
+    (asm "vldw $rd, $imm($rs1)")
+    (semantics "Load a word in a memory-capable slot")
+    (behavior
+      (set rd (load i32 signed (add rs1 imm))))
+    (latency 2)
+    (rationale "Only slot 0 reaches the memory port"))
+
+  ; Shares its word with VBRZ. `mem` and `br` are held by disjoint slots, so
+  ; the pair never competes for a bit pattern.
+  (definstruction vstw
+    (mnemonic VSTW)
+    (isa lx32)
+    (category custom)
+    (unit mem)
+    (format S)
+    (opcode 11)
+    (func3 5)
+    (func7 0)
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (imm imm i12 in))
+    (asm "vstw $rs2, $imm($rs1)")
+    (semantics "Store a word in a memory-capable slot")
+    (behavior
+      (store (add rs1 imm) rs2 i32))
+    (latency 1)
+    (rationale "Only slot 0 reaches the memory port"))
+
+  (definstruction vbrz
+    (mnemonic VBRZ)
+    (isa lx32)
+    (category custom)
+    (unit br)
+    (format S)
+    (opcode 11)
+    (func3 5)
+    (func7 0)
+    (operands
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (imm imm i12 in))
+    (asm "vbrz $rs1, $imm, $rs2")
+    (semantics "Branch when the register is zero, in the branch slot")
+    (behavior
+      (when (icmp_eq rs1 rs2) (setpc (add pc imm))))
+    (latency 1)
+    (rationale "Reuses VSTW's word: slot 3 is the only branch slot"))
+)

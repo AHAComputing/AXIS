@@ -1,0 +1,90 @@
+; A two-instruction AArch64 value-flow pattern fused into one accelerator op.
+(axis-module lisp-lowerings
+  (version "0.1")
+  (target translation)
+  (description "Typed multi-instruction lowering example")
+
+  (defisa aarch64-source
+    (role source)
+    (base armv8-a)
+    (word-bits 64)
+    (registers "x[31]:i64" "sp:i64" "pc:i64")
+    (features a64)
+    (memory-model armv8)
+    (endianness little))
+
+  (defisa accelerator-target
+    (role target)
+    (base axis-custom64)
+    (word-bits 64)
+    (registers "r[32]:i64")
+    (features scalar accelerator)
+    (memory-model explicit)
+    (endianness little))
+
+  (defformat A64_R
+    (bits 32)
+    (fields
+      (func7 31 25)
+      (rm 24 20)
+      (rn 19 15)
+      (func3 14 12)
+      (rd 11 7)
+      (opcode 6 0)))
+
+  (definstruction a64_add
+    (mnemonic A64_ADD)
+    (isa aarch64-source)
+    (format A64_R)
+    (opcode 0x0b)
+    (func3 0)
+    (func7 0)
+    (operands
+      (rd a64_gpr64 i64 out)
+      (rn a64_gpr64 i64 in)
+      (rm a64_gpr64 i64 in))
+    (asm "add $rd, $rn, $rm")
+    (semantics "Xd = Xn + Xm")
+    (formal (add i64 rn rm))
+    (latency 1)
+    (throughput 1.0)
+    (rationale "Pure AArch64 add used by the sequence matcher"))
+
+  (definstruction accel_add3
+    (mnemonic ACCEL_ADD3)
+    (isa accelerator-target)
+    (format R4)
+    (opcode 0x0b)
+    (func3 1)
+    (func7 0)
+    (encoding (func2 0))
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in)
+      (rs2 reg i64 in)
+      (rs3 reg i64 in))
+    (asm "accel.add3 $rd, $rs1, $rs2, $rs3")
+    (semantics "rd = rs1 + rs2 + rs3")
+    (formal (add i64 (add i64 rs1 rs2) rs3))
+    (latency 1)
+    (throughput 1.0)
+    (rationale "Fused accelerator target for an AArch64 add chain"))
+
+  (deflowering fuse-a64-add-chain
+    (source
+      (A64_ADD (rd $tmp) (rn $lhs) (rm $rhs))
+      (A64_ADD (rd $out) (rn $tmp) (rm $addend)))
+    (target
+      (ACCEL_ADD3
+        (rd $out)
+        (rs1 $lhs)
+        (rs2 $rhs)
+        (rs3 $addend)))
+    (requires
+      (and
+        (!= $tmp $lhs)
+        (!= $tmp $rhs)
+        (!= $tmp $addend)))
+    (source-cycles 2)
+    (target-cycles 1)
+    (benefit 2.0)))

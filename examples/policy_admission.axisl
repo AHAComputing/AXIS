@@ -1,0 +1,89 @@
+; Relative-in-flight window ADMISSION -- the third policy expressed as an accelerator, and the one
+; a measurement actually asked for.
+;
+; `policy_icount.axisl` decides WHICH thread issues. This decides which threads may DISPATCH into a
+; shared window at all, and it exists because selecting turned out to be worth about nothing while
+; admitting turned out to be worth a great deal. Measured on a trace model over mixed workloads:
+; in-flight SELECTION is +0.7% best case and -1.6% worst against plain round-robin, while relative
+; in-flight ADMISSION is +37% over an unmanaged window at six threads and twelve wide, and beats
+; every fixed share. Same counters, read at a different point in the pipe.
+;
+; The rule: a thread may dispatch while it holds no more than `min(held) + slack` window entries. A
+; thread that is issuing keeps its residency low and is never throttled; a thread piling up work it
+; cannot issue throttles itself. Nothing here needs to know the thread count, the window size, or
+; how many threads are runnable -- which is the point. A static equal share is a PARAMETER that must
+; be re-tuned whenever the thread count changes (it measured +0.13 at four threads and -1.08 at
+; eight); this is a FUNCTION of the quantity that varies, so nothing has to be reconfigured when it
+; does.
+;
+; Two accelerators, because the decision has two halves and AXIS owns the fixed-arity one:
+;
+;   `admit_min_2`   the pairwise comparison PCE reduces into a min-tree over N threads. Answers 1 to
+;                   take the right candidate when it holds strictly fewer, so ties keep the left --
+;                   the same convention the ICOUNT selector uses, and the reason a tournament and a
+;                   linear scan compute the same function.
+;   `admit_thread`  the predicate itself, a pure function of one thread's residency, the island
+;                   minimum, and the slack.
+;
+; The slack is a port rather than a constant so it stays a knob a search can move without re-emitting
+; -- and it barely matters: 4 and 8 measured within 1% of each other in every cell, which is what a
+; robust policy looks like next to a tuned constant.
+(axis-module policy_admission
+  (version "0.1.0")
+  (target rvmt)
+  (description "Relative-in-flight window admission as a pure predicate over typed ports")
+
+  (defisa policy_host
+    (word-bits 32)
+    (registers "x[32]:i32")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; A module needs an instruction; the policy is the accelerator. Kept trivial on purpose.
+  (definstruction policy_nop
+    (mnemonic POLICY_NOP)
+    (category custom)
+    (format R)
+    (opcode 0x5b) (func3 7) (func7 0x7f) (encoding (rs2 0))
+    (operands (rd reg i32 out) (rs1 reg i32 in))
+    (asm "policy.nop $rd, $rs1")
+    (semantics "identity")
+    (formal rs1)
+    (latency 1) (throughput 1.0))
+
+  ; The admission ceiling for the island this cycle. Named so a search can move the shape of the
+  ; rule -- not just the slack value -- in one place.
+  (defsem admit_ceiling ((min_held i32) (slack i32)) i32
+    (add i32 min_held slack))
+
+  (defaccelerator admit_min_2
+    (family policy)
+    (subtype window_admission)
+    (ports
+      (held0 in scalar i32)
+      (held1 in scalar i32)
+      (winner out scalar i32))
+    (semantics "argmin of window residency over two threads; ties keep the left candidate")
+    (formal
+      (if i32 (icmp_ult i32 held1 held0) 1 0))
+    (latency 1)
+    (throughput "1.0"))
+
+  (defaccelerator admit_thread
+    (family policy)
+    (subtype window_admission)
+    (ports
+      (held in scalar i32)
+      (min_held in scalar i32)
+      (slack in scalar i32)
+      (admit out scalar i32))
+    (semantics "admit while this thread holds no more than the island minimum plus the slack")
+    ; Stated as "deny iff the ceiling is strictly below what this thread holds", which is exactly
+    ; `held <= ceiling` using only `icmp_ult`. The validator does not accept `icmp_ule`, and the
+    ; obvious rewrite -- `held < ceiling + 1` -- would add an increment that can wrap. This form
+    ; adds no arithmetic and cannot.
+    (formal
+      (if i32 (icmp_ult i32 (admit_ceiling min_held slack) held) 0 1))
+    (latency 1)
+    (throughput "1.0")))

@@ -1,0 +1,2072 @@
+; One instruction set, three machines. The whole point of this corpus is that
+; the three differ in NOTHING an instruction can see: same encodings, same
+; semantics, same declared latencies. What differs is how many instructions may
+; begin in a cycle and how many of each unit there are to begin them on -- and
+; those are properties of a machine, not of what its instructions mean.
+;
+; `narrow` is deliberately the degenerate case: one issue slot, one pipelined
+; copy of every unit. A machine configured that way must reproduce the
+; first-order model that existed before a core could declare anything, cycle
+; for cycle. A second timing model that agreed with nothing would be a second
+; thing to be wrong.
+;
+; `wide` and `choked` are the same width and differ only in units, which is the
+; distinction no amount of declared throughput can express: four adders retire
+; four adds a cycle and one adder does not.
+(axis-module issuewidth
+  (version "1.0")
+  (target rvmt)
+  (description "One ISA, three machines: width and units are the machine's")
+
+  (defisa iw32
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; ⚠️ A CACHE the description declares, rather than one a host configures.
+  ; How many lines a machine keeps is a property of that machine -- which is
+  ; exactly why it belongs on `defmemory` and not on `definstruction`. The
+  ; distinction that matters is not "in the language or out of it"; it is
+  ; WHICH FORM says it. An instruction means the same thing on every machine;
+  ; a machine is where a cache lives.
+  (defmemory l1d
+    (kind cache)
+    (size-bytes 4096)
+    (line-bytes 64)
+    (ways 1)
+    (width-bits 64)
+    (latency-cycles 10))
+
+  ; Half the cache, and TWO-WAY -- so the pair differ in both of the numbers
+  ; a cache geometry has. With every memory direct-mapped, a model that
+  ; ignored the declared ways entirely agreed with the description
+  ; everywhere, and mutation testing said so.
+  (defmemory l1dsmall
+    (kind cache)
+    (size-bytes 2048)
+    (line-bytes 64)
+    (ways 2)
+    (width-bits 64)
+    (latency-cycles 10))
+
+  ; The calling convention `returns` reads its calls and returns from: RISC-V's
+  ; ILP32 shape, which is what `iw32` is built on. An ABI is declared, never
+  ; derived (L4) -- which register links is a platform's choice -- and what it
+  ; is held to is its own consistency.
+  (defabi iwabi
+    (isa iw32)
+    (pointer-bits 32)
+    (stack-alignment 16)
+    (stack-pointer (rv_gpr 2))
+    (link-register (rv_gpr 1))
+    (arguments (rv_gpr 10 17))
+    (returns (rv_gpr 10 11))
+    (callee-saved (rv_gpr 8 9) (rv_gpr 18 27))
+    (caller-saved (rv_gpr 1) (rv_gpr 5 7) (rv_gpr 10 17) (rv_gpr 28 31))
+    (reserved (rv_gpr 0) (rv_gpr 2) (rv_gpr 3) (rv_gpr 4)))
+
+  ; ⚠️ An INSTRUCTION cache (O11): four lines of sixteen instructions,
+  ; direct-mapped, and a miss holds fetch for eight cycles. Small on purpose,
+  ; so a loop can fit it or not by construction.
+  (defmemory l1i
+    (kind cache)
+    (size-bytes 256)
+    (line-bytes 64)
+    (ways 1)
+    (width-bits 32)
+    (latency-cycles 8))
+
+  (defcore narrow
+    (kind rvmt)
+    (memory l1d)
+    (implements iw32)
+    (issue-width 1)
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore wide
+    (kind rvmt)
+    (memory l1dsmall)
+    (implements iw32)
+    (issue-width 4)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 4) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore choked
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ MORE UNITS THAN ISSUE SLOTS, which is the only shape where the width
+  ; strictly binds. Everywhere else the units run out first or at the same
+  ; moment, so a model that ignored issue width entirely agreed with every
+  ; other core in this corpus -- mutation testing said so, and this core is
+  ; the answer. Four adders and two slots to start them from: the adders are
+  ; not the limit, the front end is.
+  (defcore narrowport
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 4) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ The same width as `wide`, and one UNPIPELINED multiplier. A pipelined
+  ; unit is busy for an instruction's issue interval; an unpipelined one is
+  ; busy for its whole latency, and nothing an instruction declares can tell
+  ; those apart. Without a core like this the `pipelined` flag is a field
+  ; nothing reads -- which is the exact failure this whole form exists to stop.
+  (defcore serialmul
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined false))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ Two machines that differ ONLY in what a taken branch costs them. A
+  ; machine with no predictor fetches the fall-through and has to start again
+  ; when the branch turns out to go elsewhere; a machine whose front end
+  ; never stalls pays nothing. Neither is a claim about the instructions --
+  ; IWBNZ means the same thing on both -- which is why the number is here and
+  ; not on the instruction.
+  (defcore straightline
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 1)
+    (branch (penalty 0))
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore redirects
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 1)
+    (branch (penalty 6))
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ Two machines that differ ONLY in whether they guess. Same penalty, same
+  ; width, same units -- so anything that separates them is the predictor, and
+  ; what a predictor buys is visible only over a LOOP: a branch executed once
+  ; is a cold miss whatever the machine keeps.
+  (defcore guesses
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 1)
+    (branch (penalty 6) (predictor bimodal) (entries 16))
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ OUT OF ORDER: a window, and everything else identical to `straightline`.
+  ; What a window buys is that an instruction waiting on a slow producer does
+  ; not hold up the ones behind it -- the one thing an in-order machine cannot
+  ; do at any width. `small` has a window too narrow to cover a long latency,
+  ; which is what makes the size a number worth sweeping rather than a flag.
+  (defcore ooo
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ Its limit is the REORDER BUFFER, not the scheduler: an issue queue
+  ; bigger than the buffer can never fill, which is how a description says
+  ; "the scheduler is not this machine's constraint". With the two declared
+  ; equal, either one alone reproduced the other's effect and a model that
+  ; ignored the buffer entirely still looked right -- mutation testing said so.
+  (defcore ooosmall
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 6) (issue-queue 32) (commit-width 2))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; The in-order machine it is to be compared against: same width, same units.
+  (defcore inorder
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ MEMORY ORDERING (docs/ooo_design.md, O1). Four machines that are `ooo`
+  ; in every other respect, and differ only in how a load treats the stores
+  ; older than it. Registers are not the only way one instruction waits for
+  ; another: a load that reads what a store wrote depends on it through
+  ; memory, and a window that ignores that is reading a value the program
+  ; never had.
+  ;
+  ; `waitsall` cannot know a store does not overlap it until the store has an
+  ; address, so it waits for every older one. `oracle` knows every address --
+  ; the trace does -- and waits only for a store it overlaps: the bound any
+  ; memory-dependence predictor is measured against. `noforward` makes an
+  ; overlapping load wait for the store to RETIRE rather than to execute.
+  ; `tightlsq` holds two loads in flight, which is a window a load can fill
+  ; long before the reorder buffer does.
+  (defcore waitsall
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (lsq (disambiguation conservative) (forwarding true))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore oracle
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (lsq (disambiguation perfect) (forwarding true))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore noforward
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (lsq (disambiguation perfect) (forwarding false))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore tightlsq
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (lsq (loads 2) (stores 2) (disambiguation perfect) (forwarding true))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  ; ⚠️ SPECULATION (O5). `speculates` never waits for a store whose address it
+  ; does not know yet: it bets the two do not overlap, and when an older
+  ; store's address resolves over a load that has already issued, the load
+  ; and everything after it are squashed and wait `replay` cycles to go
+  ; again. `learns` bets the same way, and remembers: a load and a store that
+  ; have collided share a store set, and the next load from that address
+  ; waits for the next store from this one. Speculation is right when
+  ; addresses rarely meet and wrong -- once per iteration, forever -- when
+  ; they always do; store sets are what make it pay for that once.
+  (defcore speculates
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (lsq (disambiguation speculative) (forwarding true) (replay 4))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  ; The same bet at three times the replay. With a chain behind the load
+  ; that the squash restarts, the two differ by exactly the difference in
+  ; replay -- the only way the number is provably read: re-executing the
+  ; chain costs more than a small replay on its own, so a machine that
+  ; replayed for free still looked slow enough.
+  (defcore slowreplay
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (lsq (disambiguation speculative) (forwarding true) (replay 12))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore learns
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (lsq (disambiguation store-sets) (forwarding true) (replay 4) (store-sets 64))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  ; ⚠️ RENAMING (O2). `ooo` renames without limit, which is what every window
+  ; here did before this form: a write never waited for a register to hold
+  ; its result. `fewregs` has six physical registers beyond the thirty-two
+  ; the ISA names, so at most six writes to the file can be in flight -- and
+  ; a window of thirty-two entries is, for anything that writes, a window of
+  ; six. Exactly `ooosmall`'s, which is the point: on a program where every
+  ; instruction writes a register the two machines are the same machine, to
+  ; the cycle, and that is what pins the count rather than its direction. What limits a machine that renames is how many results it can hold,
+  ; not how many registers its ISA names.
+  (defcore fewregs
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (rename (rv_gpr 6))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; The same machine with more registers to rename into than the window has
+  ; entries, so the file can never be what binds: it must cost EXACTLY what
+  ; `ooo` costs. A pool nothing can exhaust is the anchor that says the
+  ; accounting charges nothing it should not.
+  (defcore manyregs
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (window (rob 32) (issue-queue 32) (commit-width 2))
+    (rename (rv_gpr 32))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ GLOBAL HISTORY (O3). `guesses` keeps a counter per branch address;
+  ; `correlates` keeps one per address and recent history, so a branch that
+  ; alternates -- taken, not, taken, not -- gets a counter for each phase. A
+  ; counter per address sees both outcomes equally often and settles on
+  ; neither, which is the whole reason history was invented.
+  (defcore correlates
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 1)
+    (branch (penalty 6) (predictor gshare) (entries 16) (history 4))
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ The same predictor with ONE bit of history -- too short to see the
+  ; pattern. In a loop the outcome just before the alternating branch is
+  ; always the loop's own backward branch, taken, so one bit tells the two
+  ; phases apart no better than no bits at all. Without this core the length
+  ; was a number nothing had to read: at sixteen entries a history of four
+  ; and a history of sixty-four index the same counters, and mutation
+  ; testing said so.
+  (defcore forgets
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 1)
+    (branch (penalty 6) (predictor gshare) (entries 16) (history 1))
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ THE FRONT END (docs/ooo_design.md, O6-O7). Five machines identical in
+  ; everything a program executes on, and different in how instructions
+  ; reach it. `fetches` fetches four a cycle and they arrive two cycles
+  ; later; a branch it predicts taken ends the group it is in, because the
+  ; next instruction comes from somewhere else. Its mispredict costs the
+  ; depth -- the refill -- rather than a number typed on `branch`.
+  (defcore fetches
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; Six stages deeper. On straight-line code that is a constant -- the first
+  ; instruction arrives six cycles later and so does everything after it --
+  ; and over a loop that mispredicts it is paid again per refill.
+  (defcore deepfetch
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 8))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; A four-wide back end fed one instruction a cycle: the front end, not the
+  ; adders, is the limit.
+  (defcore narrowfetch
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 1) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; A one-entry branch target buffer. Two taken branches in one loop evict
+  ; each other every time, so each is fetched without its target and decode
+  ; finds it three cycles late -- a cost that scales with the loop.
+  (defcore smallbtb
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (btb 1) (btb-penalty 3))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; Enough entries for both: they miss once, cold, and never again.
+  (defcore bigbtb
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (btb 64) (btb-penalty 3))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ A front end that cannot hold its own pipeline: eight stages deep,
+  ; fetching four a cycle, and room for four in flight. To sustain its width a
+  ; front end has to hold width x depth instructions between fetch and
+  ; dispatch; this one holds an eighth of that, so it delivers four every
+  ; eight cycles whatever the back end could take. The buffer is the number
+  ; that decides it, and a machine whose buffer never binds could not show it.
+  (defcore starved
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 8) (buffer 4))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ TAGE (docs/ooo_design.md, O8): a bimodal base and four tagged tables
+  ; whose histories run geometrically from 2 outcomes to 32. The longest
+  ; table that recognises the history predicts. A branch that goes one way
+  ; seven times and the other way once needs to see seven outcomes back to
+  ; know which time this is -- inside a loop that is fourteen, since the loop's
+  ; own branch sits between each -- and a four-bit gshare cannot, however it
+  ; is indexed.
+  (defcore tagged
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 1)
+    (branch (penalty 6) (predictor tage) (entries 64) (history 32) (tables 4) (min-history 2))
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; The same table size with gshare's four bits of history, for comparison.
+  (defcore ghshort
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 1)
+    (branch (penalty 6) (predictor gshare) (entries 64) (history 4))
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ A predictor this library does not ship. `acme.always` is somebody
+  ; else's: its numbers (`acme.bias`) are carried to it verbatim, and the core
+  ; is REFUSED until a host registers an implementation of that name -- the
+  ; rule `model` already follows. A predictor is a component, and a component
+  ; nobody declared a vocabulary for still has a way in.
+  (defcore outsourced
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 1)
+    (branch (penalty 6) (predictor acme.always) (entries 64) (acme.bias 1))
+    (units
+      (alu (count 1) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ A RETURN STACK (O9). What a call is comes from the ABI below -- a jump
+  ; that links into its link register -- and a return is an indirect jump
+  ; through that register that does not link. Nothing is marked by hand. A
+  ; function called from two places returns to two places, and a target
+  ; buffer, which holds the last target, is wrong every time it alternates;
+  ; the stack pushed where each call came from and is right every time, until
+  ; the calls nest deeper than it holds.
+  (defcore returns
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (btb 64) (btb-penalty 3) (ras 8))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ ISSUE PORTS (O10). Two adders and a multiplier, and the multiplier
+  ; shares port p0 with one of the adders. A port starts one instruction a
+  ; cycle, so however many copies the units behind it have, adds and
+  ; multiplies together start at most two a cycle here -- where `unported`,
+  ; the same machine with each unit its own port, starts three. Which units
+  ; share a port is the question a scheduler designer actually edits, and a
+  ; count of units cannot express it.
+  (defcore ported
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0))
+    (ports (p0 alu mul) (p1 alu) (p2 br lsu))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; The same machine with no ports declared: each unit its own.
+  (defcore unported
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0))
+    (units
+      (alu (count 2) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; `fetches` reading its instructions through `l1i`. A fetch reads one line,
+  ; so a line boundary ends a fetch group, and a line not in the cache holds
+  ; fetch for the cache's latency.
+  (defcore fetchcache
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (icache l1i))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ And fetching down the WRONG path too: between a mispredict and its
+  ; resolution the front end keeps fetching where the prediction pointed, and
+  ; those lines land in the cache though nothing on them runs. That is a
+  ; prefetch when the program goes there later and pollution when it does
+  ; not -- the part of the wrong path a trace can model without running it.
+  (defcore fetchahead
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (icache l1i) (wrong-path-fetch true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ THE WRONG PATH, EXECUTED (O12). At a mispredict the functional side
+  ; forks: it runs where the prediction pointed with its stores held back
+  ; from memory and its traps swallowed, and is put back exactly. As much of
+  ; that run as the machine could reach before the branch resolved then
+  ; touches the caches -- down the path it really took, through its own
+  ; branches, and with its loads and stores. That is prefetch when the program
+  ; goes there later and pollution when it does not, for data as well as
+  ; instructions, and nothing on it ever retires.
+  (defcore runsahead
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (icache l1i) (wrong-path-execute true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; The same machine, with a wrong path that touches nothing.
+  (defcore staysput
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (icache l1i))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; And one that only FETCHES the wrong path, in line order, the way O11 does:
+  ; it cannot follow a jump on that path, because it never ran it.
+  (defcore readsahead
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (icache l1i) (wrong-path-fetch true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ EXECUTION-DRIVEN (docs/ooo_design.md, E1): `fetches`, timed the other
+  ; way round. Its front end fetches the PREDICTED path; instructions execute
+  ; when they issue -- through the generated executor, on the values older
+  ; in-flight instructions produced -- and a branch resolves when it executes.
+  ; Wrong-path work occupies the window until it is squashed, and commit steps
+  ; the golden functional model and checks every result the pipeline computed
+  ; against it. On code with no branches it must be `fetches`, cycle for cycle.
+  (defcore executes
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ THE WRONG PATH, NATIVELY (E2): `staysput`, execution-driven. Nothing
+  ; here forks or reconstructs a wrong path -- this engine fetches the
+  ; predicted path and executes it, so a wrong path's loads touch the data
+  ; cache and its fetches the instruction cache because they happened. What
+  ; O12 had to rebuild, this core simply does; the counters count only what
+  ; committed.
+  (defcore xahead
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (icache l1i))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; `returns`, execution-driven: its return stack is pushed and popped AT
+  ; FETCH, down whatever path is predicted, and put back on every squash.
+  (defcore xreturns
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (btb 64) (btb-penalty 3) (ras 8))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ SPECULATIVE HISTORY (E2): gshare on an engine that predicts a branch
+  ; while the ones before it are still in flight. Trained only at commit, the
+  ; history it predicts with is stale by every branch in flight; advanced at
+  ; fetch by each prediction and repaired on every squash, it is the history
+  ; the program actually has.
+  (defcore xcorrelates
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor gshare) (entries 64) (history 4))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ MEMORY POLICY, EXECUTION-DRIVEN (E3). `executes` with each way of
+  ; ordering a load against older stores this engine can honour -- with no
+  ; trace, only what has EXECUTED is known. `xconservative` waits for every
+  ; older store; `executes` (no lsq) and `xtightq` bet and are squashed when
+  ; wrong; `xsets` bets once and then remembers who collided. Loads and stores
+  ; are known when they DECODE, so `xtightq`'s two-entry queues bind.
+  (defcore xconservative
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (lsq (disambiguation conservative))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore xsets
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (lsq (disambiguation store-sets) (replay 4) (store-sets 64))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore xtightq
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (lsq (loads 2) (stores 2) (disambiguation speculative))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ IN ORDER, timed both ways: the same machine with no window, trace- and
+  ; execution-driven. In order or not is one line of the pipeline, and so is
+  ; how it is timed.
+  (defcore ifetch
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore iexec
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 2)
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ A machine whose MODEL is somebody else's. This is the shape closed
+  ; hardware takes in an open description: AXIS states the geometry it can
+  ; state, names the implementation that is meant to time it, and carries the
+  ; rest without pretending to read it.
+  ;
+  ; `aha.*` are parameters of a model AXIS has never heard of. They are
+  ; transported verbatim -- a round trip that normalised one would be editing
+  ; a machine it cannot read -- and they are namespaced so two vendors cannot
+  ; collide and nobody has to arbitrate.
+  ;
+  ; `provenance modelled` says what kind of number this machine's figures
+  ; would be. A closed model's cycle count and a count measured against
+  ; silicon are different claims, and a stack that renders them identically
+  ; invites the reader to confuse them.
+  ;
+  ; ⚠️ Selecting this core on a library that is not `aha-cycle-urv` is
+  ; REFUSED. Handing back the built-in pipeline's number for somebody else's
+  ; machine is the plausible wrong answer this whole boundary exists to stop.
+  (defcore ahaclosed
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (model aha-cycle-urv)
+    (provenance modelled)
+    (vendor
+      (aha.rob-partition 2)
+      (aha.lsq-depth 24)
+      (aha.hypertrace on))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 2) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ DECODE REDIRECTS (docs/ooo_design.md, D1): `smallbtb`, execution-driven.
+  ; A direct branch's target is a field of its word, so a front end that has
+  ; decoded the word knows where it goes: a predicted-taken branch the target
+  ; buffer does not hold costs `btb-penalty` and no more. Before, this engine
+  ; fell through and waited for the branch to execute -- every eviction here a
+  ; full mispredict, where its trace-driven twin charged three cycles.
+  (defcore xsmallbtb
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (btb 1) (btb-penalty 3))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ A BRANCH GUESSED TAKEN THAT FALLS THROUGH (W1): `runsahead` with a
+  ; one-entry target buffer. The wrong path is the branch's target -- which the
+  ; trace never saw, because the program did not go there. Decode names it,
+  ; `btb-penalty` after the fetch when the buffer holds another branch, so the
+  ; wrong path starts that much later and reaches that much less.
+  (defcore runsbtb
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (btb 1) (btb-penalty 3) (icache l1i) (wrong-path-execute true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ THE WRONG PATH HOLDS WHAT IT USES (W2): `runsahead` with one multiplier
+  ; that is NOT pipelined. A wrong-path multiply that issues while nothing
+  ; older wants the unit still has it when something older does -- and after
+  ; its branch has resolved: the front end is one stage deep, so the refill is
+  ; shorter than the multiply and the right path arrives to find the unit
+  ; busy. Eight spare registers: a wrong path that kept the ones it took
+  ; would leave the right path none. `contendsnot` is the same machine with a
+  ; wrong path that enters nothing.
+  (defcore contends
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (rename (rv_gpr 8))
+    (front-end (fetch-width 4) (depth 1) (icache l1i) (wrong-path-execute true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined false))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore contendsnot
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (rename (rv_gpr 8))
+    (front-end (fetch-width 4) (depth 1) (icache l1i))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined false))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ AN OPERATION ABORTED AT A SQUASH (W4): `contends` with a multiplier
+  ; that can be stopped. What a squashed multiply held is free the cycle after
+  ; the squash, so the right path no longer arrives to a unit busy with a
+  ; result nobody is waiting for. `xcontends` and `xaborts` are the same pair
+  ; on the engine that executes its own wrong path.
+  (defcore aborts
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (rename (rv_gpr 8))
+    (front-end (fetch-width 4) (depth 1) (icache l1i) (wrong-path-execute true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined false) (abort true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore xcontends
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (rename (rv_gpr 8))
+    (front-end (fetch-width 4) (depth 1) (icache l1i))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined false))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore xaborts
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (rename (rv_gpr 8))
+    (front-end (fetch-width 4) (depth 1) (icache l1i))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined false) (abort true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ WHILE DECODE LOOKS, FETCH RUNS ON (D2): `xahead` with a target buffer
+  ; that costs three cycles to miss. A branch the buffer does not hold is not
+  ; a branch to the front end until it is decoded, so for those cycles it
+  ; fetches what follows -- and the lines that came from are in the
+  ; instruction cache, whether or not the program ever falls through to them.
+  (defcore xdecodes
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (btb 64) (btb-penalty 3) (icache l1i))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ NOWHERE TO GO BUT ON (W6): `runsahead` with a return stack. A return
+  ; the stack has nothing for is, to the front end, not a branch it can
+  ; follow: it fetches what comes after until the return has read its
+  ; register, and that is its wrong path.
+  (defcore runsreturns
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2) (ras 8) (icache l1i) (wrong-path-execute true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ A MISS STALLS THE FETCH DECODE LOOKS PAST (D4): eight words a cycle
+  ; for three cycles is a line and a half beyond a jump at the end of a line.
+  ; The first of those lines is not in the cache, so fetch asks for it and
+  ; waits -- and never gets to the second. One core on each engine.
+  (defcore xwidedecodes
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 8) (depth 2) (btb 64) (btb-penalty 3) (icache l1i))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore widedecodes
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 8) (depth 2) (btb 1) (btb-penalty 3) (icache l1i) (wrong-path-execute true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ A PREDICTOR OVERRIDDEN AT DECODE (D3): gshare, which is worth waiting
+  ; two cycles for, over a bimodal table that answers in time for fetch. Where
+  ; the two disagree the front end is redirected at decode -- to the target of
+  ; a branch the quick one called not taken, back from the target of one it
+  ; called taken. What is predicted, and so what mispredicts, is gshare's: the
+  ; twins without the clause mispredict exactly as often and are never
+  ; redirected at decode. A pair on each engine.
+  (defcore overridden
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor gshare) (entries 256) (history 8) (overrides (predictor bimodal) (entries 64) (cycles 2)))
+    (front-end (fetch-width 4) (depth 2) (icache l1i) (wrong-path-execute true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore overridesnot
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor gshare) (entries 256) (history 8))
+    (front-end (fetch-width 4) (depth 2) (icache l1i) (wrong-path-execute true))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore xoverridden
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor gshare) (entries 256) (history 8) (overrides (predictor bimodal) (entries 64) (cycles 2)))
+    (front-end (fetch-width 4) (depth 2) (icache l1i))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (defcore xoverridesnot
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor gshare) (entries 256) (history 8))
+    (front-end (fetch-width 4) (depth 2) (icache l1i))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  ; ⚠️ MICRO-OPS (U1, docs/micro_ops_design.md): a core that divides a load
+  ; with an add in it into a load and an add. It says the unit and the cycles
+  ; of each; which registers each reads and writes, and which does the
+  ; loading, is read off the instruction's effects. Each micro-op is an entry
+  ; in the window and a place in the dispatch, issue and commit widths -- so
+  ; this machine starts half as many of these instructions a cycle as
+  ; `cracksnot` does -- and each issues when what IT reads is ready, so a base
+  ; moved on by the add is ready an add later, not a load later.
+  (defcore cracks
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)) (IWLP (lsu 2) (alu 1)) (IWLX (lsu 2) (alu 1)))))
+
+  (defcore cracksnot
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true))))
+
+  ; The pair on the engine that executes what it fetches. There each
+  ; micro-op executes the instruction, whole, on what the window has made by
+  ; the time IT issues, and keeps its own part; the golden model steps once,
+  ; when the last retires, and judges all of them together.
+  (defcore xcracks
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)) (IWLP (lsu 2) (alu 1)) (IWLX (lsu 2) (alu 1)))))
+
+  (defcore xcracksnot
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true))))
+
+  ; The same, its add on the ONE multiplier: a micro-op is on the unit the
+  ; core gave it, so this machine finishes one load-and-add a cycle however
+  ; many it can load.
+  (defcore cracksslow
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (mul 1)))))
+
+  ; ⚠️ TWO WAYS ROUND DECODE (U2, docs/micro_ops_design.md). One machine,
+  ; four instructions wide at fetch and eight behind it, four stages from
+  ; fetch to dispatch -- and what it is with a cache of decoded micro-ops
+  ; that delivers eight a cycle two stages out; with one no wider than
+  ; decode, so that all it saves is the stages; with one that holds a single
+  ; window, which a loop of two windows never finds anything in; and with a
+  ; buffer that replays a loop of sixteen micro-ops without a break at its
+  ; branch. All but the single window again on the engine that fetches what
+  ; it predicts. Each cracks a load-and-add in two: the cache and the buffer
+  ; count MICRO-OPS, and six instructions that are ten of those are two
+  ; cycles of an eight-wide cache, not one.
+  (defcore decodes
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 8)
+    (window (rob 64) (issue-queue 64) (commit-width 8))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 4) (icache l1i))
+    (units
+      (alu (count 8) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)))))
+
+  (defcore opcached
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 8)
+    (window (rob 64) (issue-queue 64) (commit-width 8))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 4) (icache l1i) (op-cache (entries 16) (ways 2) (window 32) (width 8) (depth 2)))
+    (units
+      (alu (count 8) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)))))
+
+  (defcore opcachedshort
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 8)
+    (window (rob 64) (issue-queue 64) (commit-width 8))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 4) (icache l1i) (op-cache (entries 16) (ways 2) (window 32) (width 4) (depth 2)))
+    (units
+      (alu (count 8) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)))))
+
+  (defcore opcachedtiny
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 8)
+    (window (rob 64) (issue-queue 64) (commit-width 8))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 4) (icache l1i) (op-cache (entries 1) (ways 1) (window 32) (width 8) (depth 2)))
+    (units
+      (alu (count 8) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)))))
+
+  (defcore loopbuffered
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 8)
+    (window (rob 64) (issue-queue 64) (commit-width 8))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 4) (icache l1i) (loop-buffer (ops 16) (width 8) (depth 1)))
+    (units
+      (alu (count 8) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)))))
+
+  (defcore xdecodesall
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 8)
+    (window (rob 64) (issue-queue 64) (commit-width 8))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 4) (icache l1i))
+    (engine execute)
+    (units
+      (alu (count 8) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)))))
+
+  (defcore xopcached
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 8)
+    (window (rob 64) (issue-queue 64) (commit-width 8))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 4) (icache l1i) (op-cache (entries 16) (ways 2) (window 32) (width 8) (depth 2)))
+    (engine execute)
+    (units
+      (alu (count 8) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)))))
+
+  (defcore xopcachedshort
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 8)
+    (window (rob 64) (issue-queue 64) (commit-width 8))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 4) (icache l1i) (op-cache (entries 16) (ways 2) (window 32) (width 4) (depth 2)))
+    (engine execute)
+    (units
+      (alu (count 8) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)))))
+
+  (defcore xloopbuffered
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 8)
+    (window (rob 64) (issue-queue 64) (commit-width 8))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 4) (icache l1i) (loop-buffer (ops 16) (width 8) (depth 1)))
+    (engine execute)
+    (units
+      (alu (count 8) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 4) (pipelined true)))
+    (timing (micro-ops (IWLA (lsu 2) (alu 1)))))
+
+  ; ⚠️ THE SCHEDULER (S1-S3, docs/scheduler_design.md). One machine, and
+  ; what it is when two enter its window a cycle instead of four; when its
+  ; wakeup-and-select loop takes two cycles, so that dependents of a one-cycle
+  ; add cannot issue back to back; when what the multiplier makes takes two
+  ; cycles more to reach an adder; and when only two instructions may wait
+  ; for the multiplier, so that a third stops everything behind it at the
+  ; door. Each again on the engine that executes what it fetches.
+  (defcore schedplain
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore dispatchestwo
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (dispatch-width 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore scheduletwo
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (schedule 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore bypasses
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (bypass (mul alu 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore queues
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true) (queue 2))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xschedplain
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xdispatchestwo
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (dispatch-width 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xscheduletwo
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (schedule 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xbypasses
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (bypass (mul alu 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xqueues
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true) (queue 2))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  ; ⚠️ S5-S7: the same machine with ONE queue of two for the multiplier and
+  ; the load unit together, so that loads waiting on each other fill the
+  ; queue a multiply would have entered; with one result renamed a cycle, so
+  ; that four adds enter one at a time and four stores all at once; and
+  ; predicting values by STRIDE, so that a pointer walked a line at a time is
+  ; chased at the speed of the loop. Each on both engines.
+  (defcore clusters
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (queues (slow (size 2) (units mul lsu)))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore renamesone
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (rename-width 1))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore renamestwo
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (rename-width 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore valuestrides
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (value-prediction (kind stride) (entries 64) (confidence 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xclusters
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (queues (slow (size 2) (units mul lsu)))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xrenamesone
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (rename-width 1))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xrenamestwo
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (rename-width 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xvaluestrides
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (value-prediction (kind stride) (entries 64) (confidence 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  ; ⚠️ S8: the same machine picking among ready instructions by where they
+  ; SIT in the issue queue, not by age. An instruction that entered while the
+  ; low slots were taken loses the multiplier to a younger one that entered
+  ; after they were given up.
+  (defcore selectsposition
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (select position))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xselectsposition
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4) (select position))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  ; ⚠️ VALUE PREDICTION (S4, docs/scheduler_design.md): a machine that says
+  ; what a load will read when that load has read the same thing twice
+  ; running. Right, and a chain of dependences through memory is gone -- a
+  ; pointer that points at itself is chased at the speed of the loop, not of
+  ; the load. Wrong, and everything after the load is fetched again. A pair on
+  ; each engine.
+  (defcore valueplain
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore valuepredicts
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (value-prediction (entries 64) (confidence 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xvalueplain
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  (defcore xvaluepredicts
+    (kind rvmt)
+    (implements iw32)
+    (memory l1d)
+    (issue-width 4)
+    (window (rob 64) (issue-queue 64) (commit-width 4))
+    (value-prediction (entries 64) (confidence 2))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 2) (pipelined true))))
+
+  ; ⚠️ TRANSLATION BUFFERS (docs/tlb_design.md): a machine remembers only so
+  ; many pages. Timing, not translation -- addresses stay the program's. A
+  ; first-level hit is in the instruction's latency; a page only the second
+  ; level holds costs its latency; a page nothing holds costs the walk too.
+  ; `tools/tlb_check.py` builds its own machines; this one is here so the
+  ; clause is printed and read back with every other.
+  (defcore xpages
+    (kind rvmt)
+    (implements iw32)
+    (issue-width 4)
+    (window (rob 32) (issue-queue 32) (commit-width 4))
+    (branch (penalty 0) (predictor bimodal) (entries 64))
+    (front-end (fetch-width 4) (depth 2))
+    (engine execute)
+    (tlb (data (entries 16) (ways 4)) (fetch (entries 8))
+         (second (entries 64) (ways 4) (latency 3))
+         (page-bytes 4096) (walk-cycles 20))
+    (units
+      (alu (count 4) (pipelined true))
+      (mul (count 1) (pipelined true))
+      (br (count 1) (pipelined true))
+      (lsu (count 1) (pipelined true))))
+
+  (definstruction iwbnz
+    (mnemonic IWBNZ)
+    (isa iw32)
+    (category custom)
+    (format B)
+    (opcode 0x4b)
+    (func3 0)
+    (unit br)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "iwbnz $rs1, $rs2, $imm")
+    (semantics "Branch when rs1 is not equal rs2")
+    (behavior
+      (when (icmp_ne rs1 rs2) (setpc (add i32 pc (sext i32 13 imm)))))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 800.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Branch when rs1 is not equal rs2"))
+
+  (definstruction iwadd
+    (mnemonic IWADD)
+    (isa iw32)
+    (category custom)
+    (format R)
+    (opcode 0x0b)
+    (unit alu)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "iwadd $rd, $rs1, $rs2")
+    (semantics "Add, on the adder")
+    (formal (add i32 rs1 rs2))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 500.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Add, on the adder"))
+
+  (definstruction iwmul
+    (mnemonic IWMUL)
+    (isa iw32)
+    (category custom)
+    (format R)
+    (opcode 0x2b)
+    (unit mul)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "iwmul $rd, $rs1, $rs2")
+    (semantics "Multiply, on the multiplier")
+    (formal (mul i32 rs1 rs2))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 4000.0)
+    (power-estimate-mw 4.0)
+    (expected-speedup 1.0)
+    (rationale "Multiply, on the multiplier"))
+  ; A load and a store, so a machine has memory traffic to order. Both issue
+  ; to `lsu`; what each MEANS is the same on every core above.
+  (definstruction iwlw
+    (mnemonic IWLW)
+    (isa iw32)
+    (category custom)
+    (format I)
+    (opcode 0x5b)
+    (func3 2)
+    (unit lsu)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "iwlw $rd, $imm($rs1)")
+    (semantics "Load a 32-bit word")
+    (behavior
+      (set rd (load i32 signed (add i32 rs1 (sext i32 12 imm)))))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 900.0)
+    (power-estimate-mw 1.5)
+    (expected-speedup 1.0)
+    (rationale "Load a 32-bit word"))
+
+  (definstruction iwsw
+    (mnemonic IWSW)
+    (isa iw32)
+    (category custom)
+    (format S)
+    (opcode 0x7b)
+    (func3 2)
+    (unit lsu)
+    (operands
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "iwsw $rs2, $imm($rs1)")
+    (semantics "Store a 32-bit word")
+    (behavior
+      (store (add i32 rs1 (sext i32 12 imm)) rs2 i32))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 900.0)
+    (power-estimate-mw 1.5)
+    (expected-speedup 1.0)
+    (rationale "Store a 32-bit word"))
+
+  ; ⚠️ An INDIRECT jump, whose target is a register's value rather than a
+  ; field of the word. A branch target buffer predicts the target a branch
+  ; went to last time; for a direct branch that never changes, so without an
+  ; instruction like this a buffer that ignored the target it stored looked
+  ; right -- mutation testing said so.
+  (definstruction iwjr
+    (mnemonic IWJR)
+    (isa iw32)
+    (category custom)
+    (format I)
+    (opcode 0x6b)
+    (func3 0)
+    (unit br)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (imm imm i32 in))
+    (asm "iwjr $rd, $rs1, $imm")
+    (semantics "Jump to rs1 plus offset, and link")
+    (behavior
+      (setpc (and i32 (add i32 rs1 (sext i32 12 imm)) 0xfffffffe))
+      (set rd (add i32 pc 4)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 600.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Jump to rs1 plus offset, and link"))
+
+  ; ⚠️ A DIRECT jump, unconditional (D1): its target is its own address plus a
+  ; field of the word, so decode knows where it goes without a predictor and
+  ; without a register. Every other jump here either asks a predictor (IWBNZ)
+  ; or reads a register (IWJR), and a front end that waited for a direct jump
+  ; to execute looked no different from one that did not.
+  (definstruction iwj
+    (mnemonic IWJ)
+    (isa iw32)
+    (category custom)
+    (format J)
+    (opcode 0x3b)
+    (unit br)
+    (operands
+      (rd rv_gpr i32 out)
+      (imm imm i32 in))
+    (asm "iwj $rd, $imm")
+    (semantics "Jump to pc plus offset, and link")
+    (behavior
+      (setpc (add i32 pc (sext i32 21 imm)))
+      (set rd (add i32 pc 4)))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 600.0)
+    (power-estimate-mw 1.0)
+    (expected-speedup 1.0)
+    (rationale "Jump to pc plus offset, and link"))
+
+  ; ⚠️ TWO INSTRUCTIONS A CORE MAY CRACK (docs/micro_ops_design.md). A load
+  ; whose result is ADDED to a register -- a load and then an add, to a
+  ; machine that has no adder behind its load unit -- and a load that moves
+  ; its base on afterwards, whose new base depends on no memory at all and so
+  ; should be ready long before what was loaded is. Uncracked, each is one
+  ; operation on the load unit, as every instruction here was.
+  (definstruction iwla
+    (mnemonic IWLA)
+    (isa iw32)
+    (category custom)
+    (format R)
+    (opcode 0x1b)
+    (unit lsu)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 in)
+      (rs2 rv_gpr i32 in))
+    (asm "iwla $rd, $rs2, ($rs1)")
+    (semantics "Load a 32-bit word and add a register to it")
+    (behavior
+      (set rd (add i32 rs2 (load i32 signed rs1))))
+    (latency 3)
+    (throughput 1.0)
+    (area-estimate-um2 2600.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 32-bit word and add a register to it"))
+
+  (definstruction iwlp
+    (mnemonic IWLP)
+    (isa iw32)
+    (category custom)
+    (format I)
+    (opcode 0x5b)
+    (func3 3)
+    (unit lsu)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 inout)
+      (imm imm i32 in))
+    (asm "iwlp $rd, ($rs1), $imm")
+    (semantics "Load a 32-bit word, then move the base on")
+    (behavior
+      (set rd (load i32 signed rs1))
+      (set rs1 (add i32 rs1 (sext i32 12 imm))))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 2600.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 32-bit word, then move the base on"))
+
+  ; A load that moves its base on by a REGISTER: the one cracked instruction
+  ; here whose second micro-op can be kept waiting -- for that register --
+  ; long after its first has finished, with what the first loaded already in
+  ; use. An instruction retired in pieces is caught there and nowhere else.
+  (definstruction iwlx
+    (mnemonic IWLX)
+    (isa iw32)
+    (category custom)
+    (format R)
+    (opcode 0x1f)
+    (unit lsu)
+    (operands
+      (rd rv_gpr i32 out)
+      (rs1 rv_gpr i32 inout)
+      (rs2 rv_gpr i32 in))
+    (asm "iwlx $rd, ($rs1), $rs2")
+    (semantics "Load a 32-bit word, then move the base on by a register")
+    (behavior
+      (set rd (load i32 signed rs1))
+      (set rs1 (add i32 rs1 rs2)))
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 2600.0)
+    (power-estimate-mw 3.0)
+    (expected-speedup 1.0)
+    (rationale "Load a 32-bit word, then move the base on by a register"))
+
+  ; ⚠️ A TRAP, so an execution-driven core has an exception to take
+  ; precisely: at commit, never on a wrong path, and never mistaken for the
+  ; pipeline computing something wrong.
+  (definstruction iwtrap
+    (mnemonic IWTRAP)
+    (isa iw32)
+    (category custom)
+    (format I)
+    (opcode 0x73)
+    (func3 0)
+    (encoding (rd 0) (rs1 0) (imm 0))
+    (operands)
+    (asm "iwtrap")
+    (semantics "Trap to the host")
+    (behavior
+      (trap ecall))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Trap to the host")))

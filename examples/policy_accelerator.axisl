@@ -1,0 +1,61 @@
+; A microarchitectural POLICY expressed as an accelerator: pure function, typed ports.
+;
+; Every other example here describes instructions. This one describes a decision a machine makes
+; every cycle and never names in its ISA -- which way to evict, which thread to issue -- and it is
+; here because that turns out to need nothing new. A policy is a pure function of committed state,
+; `defaccelerator` already carries typed ports and a `formal` expression, and the backends already
+; emit it: `emit-pyrtl` gives the datapath, `emit-golden-python` the reference model, `emit-smt2`
+; the proof obligation, `emit-semantics-rust` the fast path a search runs in its inner loop.
+;
+; The purity is the point rather than a restriction. A hook that is a pure function of the state it
+; is handed IS a combinational block, so a policy written this way is synthesisable by construction
+; and the same source can be proven equal to what gets built.
+;
+; `defsem` is inlined during elaboration, so the score below costs nothing downstream -- it exists
+; so the weights have a name and can be changed on their own.
+(axis-module policy_accelerator
+  (version "0.1.0")
+  (target rvmt)
+  (description "Cache victim selection as a pure scored decision over typed ports")
+
+  (defisa policy_host
+    (word-bits 32)
+    (registers "x[32]:i32")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; A module needs an instruction; the policy is the accelerator. Kept trivial on purpose.
+  (definstruction policy_nop
+    (mnemonic POLICY_NOP)
+    (category custom)
+    (format R)
+    (opcode 0x5b) (func3 7) (func7 0x7f) (encoding (rs2 0))
+    (operands (rd reg i32 out) (rs1 reg i32 in))
+    (asm "policy.nop $rd, $rs1")
+    (semantics "identity")
+    (formal rs1)
+    (latency 1) (throughput 1.0))
+
+  ; The learnable part: one weighted score per candidate way. Recency dominates, dirtiness breaks
+  ; ties -- writing back a clean line is cheaper, so prefer evicting it.
+  (defsem way_score ((age i32) (dirty i32)) i32
+    (add i32 (shl i32 age 2) dirty))
+
+  (defaccelerator victim_select_2way
+    (family policy)
+    (subtype replacement)
+    (ports
+      (age0 in scalar i32)
+      (dirty0 in scalar i32)
+      (age1 in scalar i32)
+      (dirty1 in scalar i32)
+      (victim out scalar i32))
+    (semantics "argmax of way_score over two candidate ways; ties go to way 1")
+    (formal
+      (if i32
+        (icmp_ult i32 (way_score age1 dirty1) (way_score age0 dirty0))
+        0
+        1))
+    (latency 1)
+    (throughput "1.0")))

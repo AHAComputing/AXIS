@@ -1,0 +1,258 @@
+; Scalable vectors, stage S1: element-wise arithmetic over a vector length that
+; is not written in the instruction (docs/scalable_vectors_design.md).
+;
+; Every instruction here says what one lane does and leaves the lane *count* to
+; the machine. `(vector-bits N)` on the ISA supplies it, and elaboration turns
+; each instruction into N/elem ordinary scalar instructions -- one per lane,
+; named with a `__l<lane>` suffix.
+;
+; Why lane-indexed rather than the packed expansion stage V1 uses: `Sem::Int`
+; holds a u128, so a packed vector cannot exceed 128 bits. That is fine for a
+; NEON Q register, which really is 128 bits, and impossible for SVE at VL=512.
+; The two representations agree wherever both exist, and tools/scalable_vs_packed.py
+; checks exactly that at VL=128 against the already-proven v4i32 expansion.
+;
+; The lane instructions share an encoding, because a real machine issues one
+; instruction that does every lane. S1 proves *semantics*, not decode: there is
+; no claim here that these are separately encodable, and the decoder story
+; arrives with the effect-level policy form in a later stage.
+(axis-module scalable_basic
+  (version "0.1.0")
+  (target rvmt)
+  (description "Element-wise arithmetic over scalable vectors")
+
+  (defisa sve_like
+    (base rv64im)
+    (word-bits 64)
+    (vector-bits 128)
+    (unspecified-realization compute)
+    (registers "z[32]:i64" "pc:i64")
+    (features simd scalable custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat SVE_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (zm 24 20)
+      (func7 31 25)))
+
+  ; The same shape with a field for `vl`. An instruction whose assembly prints
+  ; `$vl` has to carry it somewhere, and SVE_R has no bit to spare: every one of
+  ; its 32 is spoken for. Three registers, a length and an opcode fit exactly --
+  ; 7 + 5 + 3 + 5 + 5 + 5 leaves two bits of `func7`, which is enough because
+  ; `func3` already tells these three apart.
+  ;
+  ; The alternative is `vl` as architectural state read by name, which is what a
+  ; real machine does with its VL CSR. That is stage S3's work, and the note
+  ; below says so; this makes the instructions the corpus already describes
+  ; encodable, rather than changing what they are.
+  ; A scalar broadcast source, which sits where `zm` does and is called `rs`.
+  (defformat SVE_R_DUP
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (rs 24 20)
+      (func7 31 25)))
+
+  (defformat SVE_R_VL
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (zd 11 7)
+      (func3 14 12)
+      (zn 19 15)
+      (zm 24 20)
+      (vl 29 25)
+      (func7 31 30)))
+
+  (definstruction svadd_b
+    (mnemonic SVADD_B) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (zd reg i8 out) (zn reg i8 in) (zm reg i8 in))
+    (asm "svadd_b $zd, $zn, $zm")
+    (semantics "Add 8-bit lanes; the lane count is VL/8, not written here")
+    (formal (add vni8 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Add 8-bit lanes"))
+
+  (definstruction svadd_h
+    (mnemonic SVADD_H) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 1) (func7 1)
+    (operands (zd reg i16 out) (zn reg i16 in) (zm reg i16 in))
+    (asm "svadd_h $zd, $zn, $zm")
+    (semantics "Add 16-bit lanes; the lane count is VL/16, not written here")
+    (formal (add vni16 zn zm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Add 16-bit lanes"))
+
+  (definstruction svadd_s
+    (mnemonic SVADD_S) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 2) (func7 2)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "svadd_s $zd, $zn, $zm")
+    (semantics "Add 32-bit lanes; the lane count is VL/32, not written here")
+    (formal (add vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Add 32-bit lanes"))
+
+  (definstruction svadd_d
+    (mnemonic SVADD_D) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 3) (func7 3)
+    (operands (zd reg i64 out) (zn reg i64 in) (zm reg i64 in))
+    (asm "svadd_d $zd, $zn, $zm")
+    (semantics "Add 64-bit lanes; the lane count is VL/64, not written here")
+    (formal (add vni64 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Add 64-bit lanes"))
+
+  (definstruction svsub_s
+    (mnemonic SVSUB_S) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 4) (func7 4)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "svsub_s $zd, $zn, $zm")
+    (semantics "Subtract 32-bit lanes; the lane count is VL/32, not written here")
+    (formal (sub vni32 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Subtract 32-bit lanes"))
+
+  (definstruction svmul_s
+    (mnemonic SVMUL_S) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 5) (func7 5)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "svmul_s $zd, $zn, $zm")
+    (semantics "Multiply 32-bit lanes, low half; the lane count is VL/32, not written here")
+    (formal (mul vni32 zn zm))
+    (latency 3) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Multiply 32-bit lanes, low half"))
+
+  (definstruction svand_d
+    (mnemonic SVAND_D) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 6) (func7 6)
+    (operands (zd reg i64 out) (zn reg i64 in) (zm reg i64 in))
+    (asm "svand_d $zd, $zn, $zm")
+    (semantics "Bitwise and over 64-bit lanes; the lane count is VL/64, not written here")
+    (formal (and vni64 zn zm))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Bitwise and over 64-bit lanes"))
+
+  (definstruction svmax_h
+    (mnemonic SVMAX_H) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 7) (func7 7)
+    (operands (zd reg i16 out) (zn reg i16 in) (zm reg i16 in))
+    (asm "svmax_h $zd, $zn, $zm")
+    (semantics "Signed maximum of 16-bit lanes; the lane count is VL/16, not written here")
+    (formal (max vni16 zn zm))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Signed maximum of 16-bit lanes"))
+
+  (definstruction svminu_b
+    (mnemonic SVMINU_B) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 0) (func7 8)
+    (operands (zd reg i8 out) (zn reg i8 in) (zm reg i8 in))
+    (asm "svminu_b $zd, $zn, $zm")
+    (semantics "Unsigned minimum of 8-bit lanes; the lane count is VL/8, not written here")
+    (formal (minu vni8 zn zm))
+    (latency 2) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Unsigned minimum of 8-bit lanes"))
+
+  (definstruction svfadd_s
+    (mnemonic SVFADD_S) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 1) (func7 9)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in))
+    (asm "svfadd_s $zd, $zn, $zm")
+    (semantics "Add 32-bit float lanes; the lane count is VL/32, not written here")
+    (formal (fadd vnf32 zn zm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Add 32-bit float lanes"))
+
+  (definstruction svfmul_d
+    (mnemonic SVFMUL_D) (isa sve_like) (category simd) (format SVE_R)
+    (opcode 11) (func3 2) (func7 10)
+    (operands (zd reg i64 out) (zn reg i64 in) (zm reg i64 in))
+    (asm "svfmul_d $zd, $zn, $zm")
+    (semantics "Multiply 64-bit float lanes; the lane count is VL/64, not written here")
+    (formal (fmul vnf64 zn zm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "Multiply 64-bit float lanes"))
+
+  (definstruction svadd_dup_s
+    (mnemonic SVADD_DUP_S) (isa sve_like) (category simd) (format SVE_R_DUP)
+    (opcode 11) (func3 3) (func7 11)
+    (operands (zd reg i32 out) (zn reg i32 in) (rs reg i32 in))
+    (asm "svadd_dup_s $zd, $zn, $rs")
+    (semantics "Add a scalar broadcast to every 32-bit lane")
+    (formal (add vni32 zn (vdup vni32 rs)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "The broadcast source is scalar: it is the one operand that must not be lane-indexed."))
+
+  ; --- stage S2: results that are only partly specified ------------------
+  ;
+  ; `(vtail <type> <vl> <body>)` says lanes at or above `vl` are the tail, and
+  ; that the tail is *unspecified* -- RVV's tail-agnostic policy. An
+  ; implementation may leave those lanes undisturbed or write all-ones and both
+  ; are correct, so no bit-exact gate can compare their contents.
+  ;
+  ; What it can compare is *which* lanes are unconstrained, and that is the part
+  ; the architecture specifies. Each lane therefore gets a companion instruction
+  ; computing its definedness mask. The mask is ordinary semantics, so every
+  ; backend already computes it and the existing backend-vs-golden gates already
+  ; prove they agree on it exactly -- which is what makes the undefined *region*
+  ; comparable without masking.
+  ;
+  ; `vl` is declared at the element width here so the lane index and the length
+  ; compare at one width. A real machine has a single vl CSR; widening that is
+  ; stage S3's mode work, not this stage's.
+
+  (definstruction svadd_ta_s
+    (mnemonic SVADD_TA_S) (isa sve_like) (category simd) (format SVE_R_VL)
+    (opcode 11) (func3 4) (func7 1)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in) (vl reg i32 in))
+    (asm "svadd_ta_s $zd, $zn, $zm, $vl")
+    (semantics "Add 32-bit lanes; lanes at or above vl are tail")
+    (formal (vtail vni32 vl (add vni32 zn zm)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "The tail is architecturally unspecified: what is specified is which lanes it covers."))
+
+  (definstruction svmul_ta_h
+    (mnemonic SVMUL_TA_H) (isa sve_like) (category simd) (format SVE_R_VL)
+    (opcode 11) (func3 5) (func7 1)
+    (operands (zd reg i16 out) (zn reg i16 in) (zm reg i16 in) (vl reg i16 in))
+    (asm "svmul_ta_h $zd, $zn, $zm, $vl")
+    (semantics "Multiply 16-bit lanes; the tail is unspecified")
+    (formal (vtail vni16 vl (mul vni16 zn zm)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "The tail is architecturally unspecified: what is specified is which lanes it covers."))
+
+  (definstruction svfadd_ta_s
+    (mnemonic SVFADD_TA_S) (isa sve_like) (category simd) (format SVE_R_VL)
+    (opcode 11) (func3 6) (func7 1)
+    (operands (zd reg i32 out) (zn reg i32 in) (zm reg i32 in) (vl reg i32 in))
+    (asm "svfadd_ta_s $zd, $zn, $zm, $vl")
+    (semantics "Add 32-bit float lanes with an unspecified tail")
+    (formal (vtail vnf32 vl (fadd vnf32 zn zm)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1500.0) (power-estimate-mw 2.0) (expected-speedup 2.0)
+    (rationale "The tail is architecturally unspecified: what is specified is which lanes it covers."))
+)

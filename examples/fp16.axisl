@@ -1,0 +1,226 @@
+; Half precision, the third floating-point format (docs/tensor_design.md, T1).
+;
+; f16 is where the two-format assumption finally broke. Every backend picked
+; between single and double by comparing the width against 32, so a 16-bit
+; float resolved to single in C and Rust, and produced an SMT file z3 rejected
+; with a sort error. `ir::FLOAT_FORMATS` is now the table those comparisons
+; became, and this corpus is what proves the third row is real rather than
+; declared.
+;
+; The backends do NOT agree by computing the same way, which is the point:
+;
+;   golden model   Python's struct 'e' -- IEEE half, natively
+;   SMT            (_ FloatingPoint 5 11) -- the sort z3 has all along
+;   LLVM           `half` -- a native type on this target
+;   C, Rust        single precision, rounded to half in software
+;
+; The last row is not a fallback. Double rounding from p' bits to p is
+; innocuous when p' >= 2p + 2, and f32's 24 bits meet that bound exactly for
+; f16's 11 -- so computing in single and rounding once more is the correctly
+; rounded half result, for add, subtract, multiply, divide, square root and the
+; fused multiply-add alike. Rust has no stable `f16` at all, so it could not
+; have done anything else; C could have used `_Float16` and does not, because
+; the header's value is being free of compiler extensions.
+;
+; Not described, with the reason: the explicit-rounding (`fadd_rm`) and
+; exception-word (`fadd_fx`) forms of stage F3. Those carry their own
+; arithmetic in the reference model -- exact rationals for inexactness, a
+; subnormal threshold, a significand count -- and that code still asks whether
+; the width is under 32. Rather than let a half be computed as a single there,
+; `ir::FloatFormat::environment` refuses the operator for the format.
+(axis-module fp16
+  (version "0.1.0")
+  (target rvmt)
+  (description "Half-precision arithmetic, comparisons and conversions")
+
+  (defisa half32
+    (base rv32im)
+    (word-bits 32)
+    (registers "h[32]:i32" "pc:i32")
+    (features fp custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat H_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (hd 11 7)
+      (func3 14 12)
+      (hn 19 15)
+      (hm 24 20)
+      (func7 31 25)))
+
+  ; A fourth source needs somewhere to live, so the fused multiply-add takes
+  ; RISC-V's R4 shape: two discriminator bits where the others have seven.
+  (defformat H_R4
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (hd 11 7)
+      (func3 14 12)
+      (hn 19 15)
+      (hm 24 20)
+      (func2 26 25)
+      (hk 31 27)))
+
+  (definstruction fadd_h
+    (mnemonic FADD_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands (hd reg i32 out) (hn reg i32 in) (hm reg i32 in))
+    (asm "fadd_h $hd, $hn, $hm")
+    (semantics "Half addition, round-to-nearest-even")
+    (formal (fadd f16 hn hm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Half addition, round-to-nearest-even"))
+
+  (definstruction fsub_h
+    (mnemonic FSUB_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 1) (func7 0)
+    (operands (hd reg i32 out) (hn reg i32 in) (hm reg i32 in))
+    (asm "fsub_h $hd, $hn, $hm")
+    (semantics "Half subtraction")
+    (formal (fsub f16 hn hm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Half subtraction"))
+
+  (definstruction fmul_h
+    (mnemonic FMUL_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 2) (func7 0)
+    (operands (hd reg i32 out) (hn reg i32 in) (hm reg i32 in))
+    (asm "fmul_h $hd, $hn, $hm")
+    (semantics "Half multiplication")
+    (formal (fmul f16 hn hm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Half multiplication"))
+
+  (definstruction fdiv_h
+    (mnemonic FDIV_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 3) (func7 0)
+    (operands (hd reg i32 out) (hn reg i32 in) (hm reg i32 in))
+    (asm "fdiv_h $hd, $hn, $hm")
+    (semantics "Half division")
+    (formal (fdiv f16 hn hm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Half division"))
+
+  (definstruction fsqrt_h
+    (mnemonic FSQRT_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 4) (func7 0)
+    (operands (hd reg i32 out) (hn reg i32 in))
+    (encoding (hm 0))
+    (asm "fsqrt_h $hd, $hn")
+    (semantics "Half square root")
+    (formal (fsqrt f16 hn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Half square root"))
+
+  (definstruction fneg_h
+    (mnemonic FNEG_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 5) (func7 0)
+    (operands (hd reg i32 out) (hn reg i32 in))
+    (encoding (hm 0))
+    (asm "fneg_h $hd, $hn")
+    (semantics "Half negation: the sign bit alone")
+    (formal (fneg f16 hn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Half negation: the sign bit alone"))
+
+  (definstruction fma_h
+    (mnemonic FMA_H) (isa half32) (category float) (format H_R4)
+    (opcode 11) (func3 6) (encoding (func2 0))
+    (operands (hd reg i32 out) (hn reg i32 in) (hm reg i32 in) (hk reg i32 in))
+    (asm "fma_h $hd, $hn, $hm, $hk")
+    (semantics "Fused half multiply-add: one rounding, not two")
+    (formal (fma f16 hn hm hk))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Fused half multiply-add: one rounding"))
+
+  (definstruction fcmp_eq_h
+    (mnemonic FCMP_EQ_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 0) (func7 1)
+    (operands (hd reg i32 out) (hn reg i32 in) (hm reg i32 in))
+    (asm "fcmp_eq_h $hd, $hn, $hm")
+    (semantics "Ordered half equality")
+    (formal (fcmp_oeq f16 hn hm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Ordered half equality"))
+
+  (definstruction fcmp_lt_h
+    (mnemonic FCMP_LT_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 1) (func7 1)
+    (operands (hd reg i32 out) (hn reg i32 in) (hm reg i32 in))
+    (asm "fcmp_lt_h $hd, $hn, $hm")
+    (semantics "Ordered half less-than")
+    (formal (fcmp_olt f16 hn hm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Ordered half less-than"))
+
+  (definstruction fcmp_uno_h
+    (mnemonic FCMP_UNO_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 2) (func7 1)
+    (operands (hd reg i32 out) (hn reg i32 in) (hm reg i32 in))
+    (asm "fcmp_uno_h $hd, $hn, $hm")
+    (semantics "Unordered: either operand is NaN")
+    (formal (fcmp_uno f16 hn hm))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Unordered: either operand is NaN"))
+
+  (definstruction fcvt_s_h
+    (mnemonic FCVT_S_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 3) (func7 1)
+    (operands (hd reg i32 out) (hn reg i32 in))
+    (encoding (hm 0))
+    (asm "fcvt_s_h $hd, $hn")
+    (semantics "Half to single: exact, every half has a single")
+    (formal (fcvt_f2f f32 16 hn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Half to single: exact, every half has a single"))
+
+  (definstruction fcvt_h_s
+    (mnemonic FCVT_H_S) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 4) (func7 1)
+    (operands (hd reg i32 out) (hn reg i32 in))
+    (encoding (hm 0))
+    (asm "fcvt_h_s $hd, $hn")
+    (semantics "Single to half: rounds, and overflows to infinity")
+    (formal (fcvt_f2f f16 32 hn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Single to half: rounds, and overflows to infinity"))
+
+  (definstruction fcvt_w_h
+    (mnemonic FCVT_W_H) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 5) (func7 1)
+    (operands (hd reg i32 out) (hn reg i32 in))
+    (encoding (hm 0))
+    (asm "fcvt_w_h $hd, $hn")
+    (semantics "Half to signed word, toward zero, saturating")
+    (formal (fcvt_f2s i32 16 hn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Half to signed word, toward zero, saturating"))
+
+  (definstruction fcvt_h_w
+    (mnemonic FCVT_H_W) (isa half32) (category float) (format H_R)
+    (opcode 11) (func3 6) (func7 1)
+    (operands (hd reg i32 out) (hn reg i32 in))
+    (encoding (hm 0))
+    (asm "fcvt_h_w $hd, $hn")
+    (semantics "Signed word to half, which rounds and can overflow")
+    (formal (fcvt_s2f f16 32 hn))
+    (latency 4) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.2) (expected-speedup 1.0)
+    (rationale "Signed word to half, which rounds and can overflow"))
+)

@@ -1,0 +1,138 @@
+; Limbs: registers wider than a machine word.
+;
+; A register class used to occupy exactly one slot of the flat register file, so
+; the widest register an executor could hold was 64 bits. That is enough for
+; every general-purpose file described so far and for nothing beyond it: a
+; 128-bit SIMD register, never mind SVE at VL=2048, does not fit in a slot.
+;
+; A register now occupies `limbs` consecutive slots, and a view is a bit range
+; inside that span. Three cases have to be right, and all three are here:
+;
+;   vmov_s0    32 bits at bit 0   -- inside the first limb
+;   vmov_s1    32 bits at bit 32  -- inside the first limb, not at its base
+;   vmov_d1    64 bits at bit 64  -- exactly the second limb
+;   vmov_x     32 bits at bit 48  -- straddling the boundary
+;
+; The last is the only one that cannot be reached at all without limbs, and the
+; only one an implementation can fail while passing the other three: a view that
+; never crosses a boundary is served correctly by code that shifts within one
+; slot and never stitches. A corpus of in-limb views would prove nothing about
+; the reason limbs exist.
+;
+; The two mixing instructions read through one view and write through another,
+; so a stitched read has to agree with a whole-limb write and vice versa.
+(axis-module limbs
+  (version "0.1.0")
+  (target rvmt)
+  (description "Registers wider than a machine word, held as 64-bit limbs")
+
+  (defisa wide
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[16]:i64" "pc:i64")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat LIMB_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (rs 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction vmov_s0
+    (mnemonic VMOV_S0) (isa wide) (category custom) (format LIMB_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 0) (func7 0)
+    (operands (rd v128_s0 i32 out) (rs v128_s0 i32 in))
+    (asm "vmov_s0 $rd, $rs")
+    (semantics "Copy the 32-bit view at bit 0, preserving the rest")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "A view wholly inside the first limb"))
+
+  (definstruction vmov_s1
+    (mnemonic VMOV_S1) (isa wide) (category custom) (format LIMB_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 1) (func7 0)
+    (operands (rd v128_s1 i32 out) (rs v128_s1 i32 in))
+    (asm "vmov_s1 $rd, $rs")
+    (semantics "Copy the 32-bit view at bit 32, preserving the rest")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "A view inside the first limb but not at its base"))
+
+  (definstruction vmov_d1
+    (mnemonic VMOV_D1) (isa wide) (category custom) (format LIMB_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 2) (func7 0)
+    (operands (rd v128_d1 i64 out) (rs v128_d1 i64 in))
+    (asm "vmov_d1 $rd, $rs")
+    (semantics "Copy the 64-bit view at bit 64, which is the second limb")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "A view that is exactly one limb, above the first"))
+
+  (definstruction vmov_x
+    (mnemonic VMOV_X) (isa wide) (category custom) (format LIMB_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 3) (func7 0)
+    (operands (rd v128_cross i32 out) (rs v128_cross i32 in))
+    (asm "vmov_x $rd, $rs")
+    (semantics "Copy the 32-bit view at bit 48, which straddles the limb boundary")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "The case that needs stitching in both directions"))
+
+  ; Reading a straddling view and writing a whole limb: the stitched value has
+  ; to be the one the other view sees, not two halves in the wrong order.
+  (definstruction vadd_xd
+    (mnemonic VADD_XD) (isa wide) (category custom) (format LIMB_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 4) (func7 0)
+    (operands (rd v128_d1 i64 out) (rs v128_cross i32 in))
+    (asm "vadd_xd $rd, $rs")
+    (semantics "Read the straddling view, write the upper limb")
+    (behavior (set rd (add i64 rs 1)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Stitched read feeding a whole-limb write"))
+
+  ; And the reverse: a whole-limb read feeding a straddling write, which has to
+  ; leave the bits on either side of the view alone in both limbs.
+  (definstruction vadd_dx
+    (mnemonic VADD_DX) (isa wide) (category custom) (format LIMB_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 5) (func7 0)
+    (operands (rd v128_cross i32 out) (rs v128_d1 i64 in))
+    (asm "vadd_dx $rd, $rs")
+    (semantics "Read the upper limb, write the straddling view")
+    (behavior (set rd (add i64 rs 1)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Whole-limb read feeding a stitched write"))
+
+  ; A zeroing view on a register of more than one limb. The value comes from the
+  ; upper limb, which the write then has to clear: an implementation that zeroes
+  ; only the slot the view lands in leaves the source bits sitting there, and
+  ; every check that looks at the view alone still passes.
+  (definstruction vmov_z0
+    (mnemonic VMOV_Z0) (isa wide) (category custom) (format LIMB_R)
+    (encoding (rs2 0))
+    (opcode 51) (func3 6) (func7 0)
+    (operands (rd v128_z0 i32 out) (rs v128_d1 i64 in))
+    (asm "vmov_z0 $rd, $rs")
+    (semantics "Write the low 32 bits; the rest of the register becomes zero")
+    (behavior (set rd rs))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 400.0) (power-estimate-mw 0.5) (expected-speedup 1.0)
+    (rationale "Zeroing across a limb boundary, as a VEX write does to YMM"))
+)

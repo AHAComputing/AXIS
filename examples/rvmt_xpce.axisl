@@ -1,0 +1,110 @@
+; Exact Lisp-authored counterpart of rvmt_xpce.axis.
+(axis-module xpce
+  (version "1.0")
+  (target rvmt)
+  (description "RVMT custom ISA extension manifest")
+
+  (defisa rv32_axis
+    (base rv32imac)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features m a c custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (definstruction tls_load
+    (mnemonic TLS_LOAD)
+    (description "Thread-local scratchpad load with RVMT decode counter support")
+    (category memory)
+    (format I)
+    (opcode 0x0b)
+    (func3 0x1)
+    (func7 0x02)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (imm imm i12 in))
+    (asm "tls_load $rd, $rs1, $imm")
+    (semantics "rd = load_tls(rs1 + imm)")
+    (latency 2)
+    (throughput 1.0)
+    (area-estimate-um2 1200.0)
+    (power-estimate-mw 1.5)
+    (expected-speedup 1.4)
+    (intrinsic llvm.pce.tls.load)
+    (applicable-patterns thread_local memory_hiding)
+    (patterns thread_local memory_hiding)
+    (rationale "Exposes thread-local loads as a custom op so AHA can score memory hiding opportunities."))
+
+  (definstruction fma_i
+    (mnemonic FMA_I)
+    (description "Integer fused multiply-add.")
+    (category arithmetic)
+    (format R4)
+    (opcode 0x0b)
+    (func3 0x3)
+    (func7 0x00)
+    (encoding (func2 0))
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (rs3 reg i32 in))
+    (asm "fma_i $rd, $rs1, $rs2, $rs3")
+    (semantics "rd = rs1 * rs2 + rs3")
+    (formal (add i32 (mul i32 rs1 rs2) rs3))
+    (latency 1)
+    (throughput 1.0)
+    (area-estimate-um2 2000.0)
+    (power-estimate-mw 2.5)
+    (expected-speedup 1.6)
+    (intrinsic pce.fma_i)
+    (applicable-patterns mac dense_matrix)
+    (patterns mac dense_matrix)
+    (rationale "Demonstrates typed instruction semantics flowing into generated PyRTL hooks."))
+
+  (defcore rvmt0
+    (kind rvmt)
+    (implements rv32_axis)
+    (threads 4)
+    (features m atomics barriers custom))
+
+  (defaccelerator nearasic0
+    (family nearasic)
+    (subtype reduce)
+    (descriptor-version 1)
+    (target nearasic)
+    (coupling queue_descriptor)
+    (ports
+      (a input bits i32)
+      (b input bits i32)
+      (y output bits i32))
+    (semantics "y = a * b")
+    (formal (mul i32 a b))
+    (latency 4)
+    (throughput 1.0)
+    (resources lanes=1))
+
+  (defmemory l1
+    (kind sram)
+    (size-bytes 32768)
+    (ports 2)
+    (latency-cycles 1)
+    (width-bits 32)
+    (banks 1)
+    (attributes cache))
+
+  (defmemory scratchpad
+    (kind scratchpad)
+    (size-bytes 65536)
+    (ports 2)
+    (latency-cycles 1)
+    (width-bits 32)
+    (banks 4)
+    (attributes explicit dma_visible))
+
+  (deftile rvmt_tile0
+    (cores rvmt0)
+    (accelerators nearasic0)
+    (memories l1 scratchpad)
+    (interconnect crossbar)))

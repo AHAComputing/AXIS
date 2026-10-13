@@ -1,0 +1,75 @@
+; Exact Lisp-authored counterpart of mode_polymorphic.axis.
+(axis-module xpoly
+  (version "1.0")
+  (target rvmt)
+  (description "PCE-field polymorphic-tile mode example (personality stage P2)")
+
+  (defisa rv32_axis
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features m custom))
+
+  (defmode field_mode
+    (csr 0x7c0)
+    (field 1 0)
+    (values
+      (scalar 0)
+      (simt 1)
+      (xnn 2))
+    (default scalar)
+    (description "PCE-field tile personality selector"))
+
+  (definstruction scalar_op
+    (mnemonic SCALAR_OP)
+    (use-properties rv32_binary)
+    (func3 0)
+    (modes scalar simt)
+    (asm "scalar_op $rd, $rs1, $rs2")
+    (semantics "rd = rs1 + rs2")
+    (formal (add i32 rs1 rs2))
+    (rationale "Scalar/SIMT custom op sharing the tensor op's encoding."))
+
+  (definstruction tensor_op
+    (mnemonic TENSOR_OP)
+    (use-properties rv32_binary)
+    (func3 0)
+    (modes xnn)
+    (asm "tensor_op $rd, $rs1, $rs2")
+    (semantics "rd = rs1 * rs2")
+    (formal (mul i32 rs1 rs2))
+    (rationale "XNN tensor op reusing the scalar op's encoding in a disjoint mode."))
+
+  (definstruction simt_special
+    (mnemonic SIMT_SPECIAL)
+    (use-properties rv32_binary)
+    (func3 2)
+    (modes simt)
+    (asm "simt_special $rd, $rs1, $rs2")
+    (semantics "rd = rs1 - rs2")
+    (formal (sub i32 rs1 rs2))
+    (rationale "A simt-only op whose encoding is illegal in other modes."))
+
+  (definstruction always_xor
+    (mnemonic ALWAYS_XOR)
+    (use-properties rv32_binary)
+    (func3 1)
+    (asm "always_xor $rd, $rs1, $rs2")
+    (semantics "rd = rs1 ^ rs2")
+    (formal (xor i32 rs1 rs2))
+    (rationale "A mode-free op, legal in all modes."))
+
+  (defcore pce_tile0
+    (kind rvmt)
+    (implements rv32_axis)
+    (threads 8))
+
+  ; Forward-declared shared encoding/operand surface.
+  (defproperties rv32_binary
+    (format R)
+    (opcode 0x0b)
+    (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))))

@@ -1,0 +1,78 @@
+; A cache policy HINT, and a policy that reads it.
+;
+; `policy_accelerator.axisl` expresses a victim rule as a pure function. Measurement then said a
+; STATIC rule is a workload bet: the same linear score reaches Belady's optimum on a cyclic trace
+; (evict the most recently used -- the loop will not come back to it soon) and is WORSE THAN LRU on
+; a reuse-heavy one. Both are correct policies for their workload and neither is correct for both.
+;
+; Software knows which one it is about to run. This is how it says so.
+;
+; Three deliberate choices, because each has a cheaper wrong version:
+;
+; * The hint writes a NAMED STATE REGISTER, not a `defmode`. A mode gates DECODE LEGALITY, and a
+;   policy hint must not change which instructions are legal -- a program compiled without the hint
+;   must keep running, one that issues a nonsense hint must keep computing the right answer. The
+;   register is the same `setstate` shape `vsetmask` already uses for GRV's exec mask.
+;
+; * The register is ARCHITECTURAL, and that is a real cost accepted on purpose. It is visible to a
+;   debugger and it survives a context switch, which a hidden bit would not -- without it a switched-
+;   to context silently inherits the previous tenant's policy. The price is that the hint is no
+;   longer inert over ALL machine state, only over the program's RESULTS, and that scoping has to be
+;   declared rather than assumed (PCE's `hint_inertness` records it as an exclusion).
+;
+; * The policy reads the mode as an ORDINARY INPUT PORT. It stays a pure function -- the state lives
+;   outside it, as it must for the thing to be a combinational block.
+;
+; The hint is ADVISORY. A wrong one costs cycles and can never cost correctness, which is what makes
+; it safe to emit from a compiler that is guessing.
+(axis-module policy_hint
+  (version "0.1.0")
+  (target rvmt)
+  (description "A cache policy hint, and a victim rule that reads it")
+
+  (defisa policy_host
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32" "cache_policy:i8")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; cache_policy <- rs1.  0 = reuse (evict the least recently used), 1 = streaming (evict the most
+  ; recently used, because a stream will not come back for it).
+  (definstruction cache_hint
+    (mnemonic CACHE_HINT)
+    (isa policy_host)
+    (category custom)
+    (format R)
+    (opcode 0x5b) (func3 1) (func7 0x21)
+    (operands (rs1 reg i32 in))
+    (encoding (rd 0) (rs2 0))
+    (asm "cache.hint $rs1")
+    (semantics "cache_policy = rs1: declare the access pattern of the region that follows")
+    (behavior
+      (setstate cache_policy rs1 i8))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "Advisory: changes which line is evicted, never which value is computed."))
+
+  ; Recency dominates, dirtiness breaks ties -- evicting a clean line costs no writeback.
+  (defsem way_score ((age i32) (dirty i32)) i32
+    (add i32 (shl i32 age 2) dirty))
+
+  (defaccelerator victim_select_hinted
+    (family policy)
+    (subtype replacement)
+    (ports
+      (mode in scalar i32)
+      (age0 in scalar i32)
+      (dirty0 in scalar i32)
+      (age1 in scalar i32)
+      (dirty1 in scalar i32)
+      (victim out scalar i32))
+    (semantics "mode 0: evict the higher score (LRU). mode 1: evict the lower score (MRU).")
+    (formal
+      (if i32 mode
+        (if i32 (icmp_ult i32 (way_score age0 dirty0) (way_score age1 dirty1)) 0 1)
+        (if i32 (icmp_ult i32 (way_score age1 dirty1) (way_score age0 dirty0)) 0 1)))
+    (latency 1)
+    (throughput "1.0")))

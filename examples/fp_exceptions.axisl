@@ -1,0 +1,179 @@
+; IEEE-754 exception flags: the second thing a floating-point operation
+; produces.
+;
+; Every float corpus here described what an operation *computes* and nothing
+; about what it *signals*. That is a description of a machine whose exception
+; flags never move -- and it was invisible, because the differential compares
+; values and no backend modelled flags either, so all six agreed perfectly
+; about a machine that cannot raise inexact.
+;
+; A `_fx` operator yields the five-bit word the same arithmetic raises, in
+; RISC-V's `fflags` order: invalid 16, divide-by-zero 8, overflow 4,
+; underflow 2, inexact 1. An instruction accrues it, because that is what
+; `fflags` means -- arithmetic sets bits and only a CSR write clears them.
+;
+; Conversions signal too, and one of them for a reason arithmetic never has:
+; float-to-integer is truncate-saturate-NaN-to-zero here, so `invalid` reports
+; that the value did not fit the destination rather than that the arithmetic
+; had no answer. It excludes inexact -- a saturated result says it did not fit,
+; not that it was rounded -- which is the one rule in this file no backend can
+; read off the floating-point environment, because the C cast whose flags it
+; would report is undefined in exactly that case.
+;
+; Inexact is why this is an operator rather than something written out of
+; existing ones the way FCLASS was: it asks whether the *exact* result is
+; representable, which is a question about a value no bit pattern holds. The
+; golden model forms exact rationals and can answer it; C clears and reads the
+; environment; Rust, LLVM and SMT decline, each for a reason it already
+; declines directed rounding for.
+(axis-module fp_exceptions
+  (version "1.0.0")
+  (target rvmt)
+  (description "Floating-point arithmetic that says what it signalled")
+
+  (defisa fpx
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64" "fflags:i5")
+    (memory-model rvwmo)
+    (endianness little))
+
+  (definstruction faddx_d
+    (mnemonic FADDX_D)
+    (isa fpx)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 0)
+    (func7 0)
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in)
+      (rs2 reg i64 in))
+    (asm "faddx.d $rd, $rs1, $rs2")
+    (semantics "Double add, accruing the exceptions it raises")
+    (behavior
+      (set rd (fadd f64 rs1 rs2))
+      (setstate fflags (or i5 fflags (fadd_fx f64 rs1 rs2)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "The witness for inexact, overflow and underflow"))
+
+  (definstruction fdivx_d
+    (mnemonic FDIVX_D)
+    (isa fpx)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 1)
+    (func7 0)
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in)
+      (rs2 reg i64 in))
+    (asm "fdivx.d $rd, $rs1, $rs2")
+    (semantics "Double divide, accruing the exceptions it raises")
+    (behavior
+      (set rd (fdiv f64 rs1 rs2))
+      (setstate fflags (or i5 fflags (fdiv_fx f64 rs1 rs2)) i5))
+    (latency 8)
+    (throughput 0.5)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "The witness for divide-by-zero and for invalid at 0/0"))
+
+  (definstruction fsqrtx_d
+    (mnemonic FSQRTX_D)
+    (isa fpx)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 2)
+    (func7 0) (encoding (rs2 0))
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in))
+    (asm "fsqrtx.d $rd, $rs1")
+    (semantics "Double square root, accruing the exceptions it raises")
+    (behavior
+      (set rd (fsqrt f64 rs1))
+      (setstate fflags (or i5 fflags (fsqrt_fx f64 rs1)) i5))
+    (latency 12)
+    (throughput 0.25)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "The witness for invalid on a negative operand"))
+
+  (definstruction fcvtx_w_d
+    (mnemonic FCVTX_W_D)
+    (isa fpx)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 3)
+    (func7 0) (encoding (rs2 0))
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in))
+    (asm "fcvtx.w.d $rd, $rs1")
+    (semantics "Double to word, accruing what the conversion signalled")
+    (behavior
+      (set rd (sext i64 32 (fcvt_f2s i32 64 rs1)))
+      (setstate fflags (or i5 fflags (fcvt_f2s_fx i32 64 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "The witness for invalid-by-saturation, which excludes inexact"))
+
+  (definstruction fcvtx_d_w
+    (mnemonic FCVTX_D_W)
+    (isa fpx)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 4)
+    (func7 0) (encoding (rs2 0))
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in))
+    (asm "fcvtx.d.w $rd, $rs1")
+    (semantics "Word to double, accruing what the conversion signalled")
+    (behavior
+      (set rd (fcvt_s2f f64 32 rs1))
+      (setstate fflags (or i5 fflags (fcvt_s2f_fx f64 32 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "Exact for every int32, so the witness that a flag stays clear"))
+
+  (definstruction fcvtx_s_d
+    (mnemonic FCVTX_S_D)
+    (isa fpx)
+    (category custom)
+    (format R)
+    (opcode 11)
+    (func3 5)
+    (func7 0) (encoding (rs2 0))
+    (operands
+      (rd reg i64 out)
+      (rs1 reg i64 in))
+    (asm "fcvtx.s.d $rd, $rs1")
+    (semantics "Double to single, accruing what the narrowing signalled")
+    (behavior
+      (set rd (fcvt_f2f f32 64 rs1))
+      (setstate fflags (or i5 fflags (fcvt_f2f_fx f32 64 rs1)) i5))
+    (latency 4)
+    (throughput 1.0)
+    (area-estimate-um2 0.0)
+    (power-estimate-mw 0.0)
+    (expected-speedup 1.0)
+    (rationale "The witness for overflow and underflow from a narrowing")))

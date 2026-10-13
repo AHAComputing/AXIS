@@ -1,0 +1,35 @@
+; A guarded register write: the one effect shape where "did this instruction
+; write a register" is a runtime question rather than a static property of the
+; behavior. Executors and JIT backends must honour the flag their effect
+; handler reports instead of assuming the destination is always committed.
+(axis-module effects_guarded_set
+  (version "0.1.0")
+  (target rvmt)
+  (description "Guarded register write (conditional move)")
+
+  (defisa rv32_axis
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features m custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (definstruction cmov_eq
+    (mnemonic CMOVEQ_X)
+    (isa rv32_axis)
+    (category custom)
+    (format R)
+    (opcode 11) (func3 0) (func7 0)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "cmoveq_x $rd, $rs1, $rs2")
+    (semantics "Write rs1 into rd only when rs1 equals rs2")
+    (behavior
+      (when (eq rs1 rs2)
+        (set rd (add i32 rs1 rs2))))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.0) (expected-speedup 1.1)
+    (rationale "Exercises the guarded register-write path end to end.")))

@@ -1,0 +1,156 @@
+; GRV's SIMT predication surface -- the lane-control half of a warp machine.
+;
+; GRV is PCE's SIMT throughput core: one instruction stream, N lanes, and an
+; execution mask that says which of them are live. Six of these seven
+; instructions do nothing but move that mask, and the seventh is the only way a
+; program can find out which lane it is -- which makes it the one every
+; divergent predicate is ultimately built from.
+;
+; The surface is described here because it previously existed THREE times in
+; PCE with nothing keeping the copies in step: the harness encoders that tests
+; emit, the decoder constants the hardware accepts, and a prose table in the
+; divergence-stack module. An encoder that moves while a decoder does not
+; produces tests that exercise nothing, and the pass rate does not change.
+;
+; What this file pins today is the ENCODING: the CUSTOM_2 opcode space, the
+; funct7 allocation, and each instruction's operands. PCE's GRVCONF.5 gate
+; consumes `emit-aha-json` from here and proves the encoders, the decoder and
+; this description agree, plus that the decoder accepts no CUSTOM_2 encoding
+; this file does not declare.
+;
+; What it does NOT yet pin is executable semantics for the mask ops, and the
+; reason is a modelling decision rather than an omission. AXIS represents a
+; predicate as a VECTOR whose lanes are 0 or 1 (docs/scalable_vectors_design.md),
+; which is the right representation for SVE and RVV. GRV's exec-mask is instead a
+; PACKED bitmask in architectural state, with a stack behind it so divergence
+; nests. Those are two representations of one idea, and bridging them is worth
+; doing deliberately -- as `vsetmask`'s scalar-vs-lane operand question, and as
+; whether the mask stack is a register file or a state slot -- rather than by
+; picking whichever spelling elaborates first. `vlaneid` is the exception: it is
+; exactly RVV's `viota` over an all-ones mask, so it is stated formally below.
+(axis-module grv_simt
+  (version "0.1.0")
+  (target rvmt)
+  (description "GRV SIMT predication and lane identity (CUSTOM_2)")
+
+  (defisa grv_simt
+    (base rv32im)
+    (word-bits 32)
+    (vector-bits 128)
+    (lanes 4)
+    (registers "x[32]:i32" "pc:i32" "exec_mask:i8" "mask_enclosing:i8")
+    (features simd predicated custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  ; exec_mask[k] <- (rs1[k] != 0)
+  (definstruction vsetmask
+    (mnemonic VSETMASK) (isa grv_simt) (category custom) (format R)
+    (opcode 0x5b) (func3 0) (func7 0x20)
+    (operands (rs1 reg i32 in))
+    (encoding (rd 0) (rs2 0))
+    (asm "vsetmask $rs1")
+    (semantics "exec_mask = pred: set the warp's lane mask from the per-lane predicate")
+    (behavior
+      (setstate exec_mask rs1 i8))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "Frontend-handled: carries no backend and must not be dispatched."))
+
+  ; exec_mask <- all ones
+  (definstruction vmaskall
+    (mnemonic VMASKALL) (isa grv_simt) (category custom) (format R)
+    (opcode 0x5b) (func3 0) (func7 0x21)
+    (operands)
+    (encoding (rd 0) (rs1 0) (rs2 0))
+    (asm "vmaskall")
+    (semantics "exec_mask = all ones: reconverge every lane unconditionally")
+    (behavior
+      (setstate exec_mask 255 i8))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "Frontend-handled."))
+
+  ; rd[k] <- k
+  (definstruction vlaneid
+    (mnemonic VLANEID) (isa grv_simt) (category custom) (format R)
+    (opcode 0x5b) (func3 0) (func7 0x22)
+    (operands (rd reg i32 out))
+    (encoding (rs1 0) (rs2 0))
+    (asm "vlaneid $rd")
+    (semantics "rd[k] = k: the lane-id iota")
+    ; `lane_id` and NOT `(vid vni32)`, though both state the same value.
+    ;
+    ; `vid` is a VECTOR: it yields every lane's index at once, which is right
+    ; for RVV's `vid.v` and makes the instruction a lane GROUP. A group reaches
+    ; `emit-aha-json` as one entry per lane sharing one opcode/func3/func7, so
+    ; a consumer keyed by decode sees four instructions where the machine has
+    ; one, and the manifest stops being a statement of the ENCODING surface.
+    ;
+    ; `lane_id` is THIS lane's index, read like any other architectural state.
+    ; That is the right shape for a SIMT machine, whose registers are ordinary
+    ; per-lane scalars rather than packed vectors: the instruction stays one
+    ; instruction, and the lane it is running on is a property of the executing
+    ; context, which is exactly what `(lanes 4)` declares.
+    (behavior (set rd lane_id))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "The one predication-adjacent op that WRITES a register, so it rides the normal dispatch/writeback path. Without it no divergent predicate can be computed at all, so a frontend that wires the divergence stack must wire the iota too."))
+
+  ; push(exec_mask); exec_mask <- exec_mask & (rs1[k] != 0)
+  (definstruction vif
+    (mnemonic VIF) (isa grv_simt) (category control) (format R)
+    (opcode 0x5b) (func3 0) (func7 0x23)
+    (operands (rs1 reg i32 in) (rs2 imm i32 in))
+    (encoding (rd 0))
+    (asm "vif $rs1, $rs2")
+    (behavior
+      (setstate mask_enclosing exec_mask i8)
+      (setstate exec_mask (and i8 exec_mask rs1) i8))
+    (semantics "push(exec_mask); exec_mask &= (rs1[k] != 0). The rs2 field carries a skip offset in instruction words to the matching velse/vendif; 0 means straight-line predication, and a non-zero offset redirects the PC past a block whose mask is empty.")
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "Frontend-handled; the push is what makes divergence nestable."))
+
+  ; exec_mask <- top(stack) & ~exec_mask
+  (definstruction velse
+    (mnemonic VELSE) (isa grv_simt) (category control) (format R)
+    (opcode 0x5b) (func3 0) (func7 0x24)
+    (operands (rs2 imm i32 in))
+    (encoding (rd 0) (rs1 0))
+    (asm "velse $rs2")
+    (behavior
+      (setstate exec_mask (and i8 mask_enclosing (not i8 exec_mask)) i8))
+    (semantics "exec_mask = top(stack) & ~exec_mask: the enclosing mask minus the then-arm. The rs2 field carries the skip offset to the matching vendif.")
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "Frontend-handled."))
+
+  ; exec_mask <- pop(stack)
+  (definstruction vendif
+    (mnemonic VENDIF) (isa grv_simt) (category control) (format R)
+    (opcode 0x5b) (func3 0) (func7 0x25)
+    (operands)
+    (encoding (rd 0) (rs1 0) (rs2 0))
+    (asm "vendif")
+    (behavior
+      (setstate exec_mask mask_enclosing i8))
+    (semantics "exec_mask = pop(stack): reconverge exactly to the enclosing mask")
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "Frontend-handled."))
+
+  ; exec_mask <- immediate lane bitmask
+  (definstruction vmaski
+    (mnemonic VMASKI) (isa grv_simt) (category custom) (format R)
+    (opcode 0x5b) (func3 0) (func7 0x26)
+    (operands (rs2 imm i32 in))
+    (encoding (rd 0) (rs1 0))
+    (asm "vmaski $rs2")
+    (behavior
+      (setstate exec_mask rs2 i8))
+    (semantics "exec_mask = rs2: set the lane mask from an immediate bitmask carried in the rs2 field")
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 0.0) (power-estimate-mw 0.0) (expected-speedup 1.0)
+    (rationale "Applied quiescently by the OoO frontend, which drains first."))
+)

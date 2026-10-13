@@ -1,0 +1,85 @@
+; Exact Lisp-authored counterpart of personality_composition.axis.
+(axis-module xpce_compose
+  (version "1.0")
+  (target rvmt)
+  (description "PCE-field personality composition example (stage P3)")
+
+  (defisa rv32_axis
+    (base rv32im)
+    (word-bits 32)
+    (registers "x[32]:i32" "pc:i32")
+    (features m custom))
+
+  (defmode field_mode
+    (csr 0x7c0)
+    (field 1 0)
+    (values
+      (scalar 0)
+      (simt 1)
+      (xnn 2))
+    (default scalar)
+    (description "PCE-field tile personality selector"))
+
+  (definstruction fma_i
+    (mnemonic FMA_I)
+    (use-properties rv32_custom)
+    (format R4)
+    (func3 3)
+    (encoding (func2 0))
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in)
+      (rs3 reg i32 in))
+    (asm "fma_i $rd, $rs1, $rs2, $rs3")
+    (semantics "rd = rs1 * rs2 + rs3")
+    (formal (add i32 (mul i32 rs1 rs2) rs3))
+    (rationale "Mode-agnostic op exercised by the migration round-trip."))
+
+  (definstruction xorshift
+    (mnemonic XORSHIFT)
+    (use-properties rv32_custom)
+    (format R)
+    (func3 4)
+    (operands
+      (rd reg i32 out)
+      (rs1 reg i32 in)
+      (rs2 reg i32 in))
+    (asm "xorshift $rd, $rs1, $rs2")
+    (semantics "rd = rs1 ^ (rs2 << 1)")
+    (formal (xor i32 rs1 (shl i32 rs2 2)))
+    (rationale "Second mode-agnostic op so migration programs interleave."))
+
+  (defpersonality scalar1
+    (mode scalar)
+    (implements rv32_axis)
+    (discipline independent (threads 1))
+    (use-properties portable_state)
+    (description "single-thread scalar personality"))
+
+  (defpersonality simt8
+    (mode simt)
+    (implements rv32_axis)
+    (discipline lockstep (lanes 8))
+    (use-properties portable_state)
+    (description "8-lane lockstep SIMT personality"))
+
+  (defpersonality xnn0
+    (mode xnn)
+    (implements rv32_axis)
+    (discipline systolic (rows 8) (cols 8))
+    (use-properties portable_state)
+    (description "8x8 systolic tensor personality (same capsule)"))
+
+  (defcore pce_tile0
+    (kind rvmt)
+    (implements rv32_axis)
+    (threads 8)
+    (personalities scalar1 simt8 xnn0))
+
+  (defproperties rv32_custom
+    (opcode 0x0b)
+    (func7 0))
+
+  (defproperties portable_state
+    (capsule "x[32]" pc)))
