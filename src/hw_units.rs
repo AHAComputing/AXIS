@@ -1179,6 +1179,11 @@ pub fn plan_slot_units(design: &mut HwDesign) -> Vec<(String, Vec<MemberRef>)> {
         .collect();
     for (i, behavior) in design.behaviors.iter().enumerate() {
         let Ok(effects) = &behavior.effects else { continue };
+        // A unit's slots have one load address. An instruction that makes
+        // several accesses is built on its own and joins no unit.
+        if !behavior.extra_loads.is_empty() {
+            continue;
+        }
         let class = if !behavior.unit.is_empty() {
             behavior.unit.clone()
         } else if behavior.load.is_some() || effects.iter().any(|e| e.kind == EffectKind::Store) {

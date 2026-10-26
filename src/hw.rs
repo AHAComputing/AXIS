@@ -2040,12 +2040,23 @@ pub struct HwEffect {
     pub addr: Option<NodeId>,
 }
 
-/// The one load an instruction makes: where from, how much, and whether what
-/// comes back is sign-extended. What comes back is the input [`LOAD_INPUT`].
+/// A load an instruction makes: where from, how much, and whether what comes
+/// back is sign-extended. What comes back is the input `input`: [`LOAD_INPUT`]
+/// for an instruction's first load, then [`load_input`] of its position.
 pub struct HwLoad {
     pub addr: NodeId,
     pub width: u32,
     pub signed: bool,
+    pub input: String,
+}
+
+/// The input carrying what load `k` of an instruction read.
+pub fn load_input(k: usize) -> String {
+    if k == 0 {
+        LOAD_INPUT.to_string()
+    } else {
+        format!("{LOAD_INPUT}{k}")
+    }
 }
 
 /// An instruction described by its EFFECTS -- a branch, a jump, a load, a
@@ -2064,6 +2075,10 @@ pub struct HwBehavior {
     /// Which of `inputs` are architectural state.
     pub state_inputs: Vec<String>,
     pub load: Option<HwLoad>,
+    /// Loads after the first, in the order they are made. A load's address may
+    /// read what an earlier one returned -- a table indexed by loaded data --
+    /// so a consumer answers them in this order.
+    pub extra_loads: Vec<HwLoad>,
     pub effects: Result<Vec<HwEffect>, String>,
     /// The functional unit the description assigns it to, if it says, and
     /// the cycles it declares: what a unit planner over effects groups by.
@@ -2071,15 +2086,18 @@ pub struct HwBehavior {
     pub latency: u32,
 }
 
-/// Replace the load in `expr`, if there is one, by the input that carries its
-/// result, and say what it loads. Two loads in one expression are declined: an
-/// instruction that makes two accesses needs two memory ports or two cycles,
-/// which is a decision about a core.
+/// Replace each load in `expr` by the input that carries its result, and say
+/// what it loads, innermost first: a load in another's address is made before
+/// it. How several accesses are made -- ports, cycles -- is a core's decision;
+/// the netlist gives each one an address out and a value in.
 fn take_load(expr: &SemanticExpr, width: u32, found: &mut Vec<(SemanticExpr, u32, bool)>)
              -> SemanticExpr {
     if let Some((addr, access, signed)) = crate::effects::plain_load(expr) {
-        found.push((addr.clone(), access, signed));
-        let load = SemanticExpr::Atom(LOAD_INPUT.to_string());
+        // A load inside the address is made first: its value is what the
+        // address reads.
+        let addr = take_load(addr, width, found);
+        found.push((addr, access, signed));
+        let load = SemanticExpr::Atom(load_input(found.len() - 1));
         if !signed || access >= width {
             return load;
         }
@@ -2203,6 +2221,7 @@ fn lower_behavior(
     }
     let mut env = HashMap::new();
     let mut load: Option<HwLoad> = None;
+    let mut extra_loads: Vec<HwLoad> = Vec::new();
     let effects = (|| {
         for (name, width) in &inputs {
             if *width == 0 || *width > MAX_WIDTH {
@@ -2212,33 +2231,48 @@ fn lower_behavior(
         }
         let mut lowered = Vec::new();
         let mut loads: Vec<(SemanticExpr, u32, bool)> = Vec::new();
-        let mut load_address: Option<NodeId> = None;
-        // Lower one expression at `width`, taking out its load.
+        // The loads made, and since the last store, which address each read:
+        // reading the same place twice with no store between is one load.
+        let mut made: Vec<HwLoad> = Vec::new();
+        let mut fresh: Vec<usize> = Vec::new();
+        // Lower one expression at `width`, taking out its loads.
         let mut value_of = |graph: &mut HwGraph,
                             env: &mut HashMap<String, NodeId>,
                             expr: &crate::effects::EffectExpr,
                             width: u32,
                             loads: &mut Vec<(SemanticExpr, u32, bool)>,
-                            load_address: &mut Option<NodeId>|
+                            made: &mut Vec<HwLoad>,
+                            fresh: &mut Vec<usize>|
          -> Result<NodeId, String> {
             if width == 0 || width > MAX_WIDTH {
                 return Err("an effect with no width, or one wider than the graph holds".to_string());
             }
             let before = loads.len();
             let taken = take_load(&with_references(&expr.expr, functions), width, loads);
-            if loads.len() > before {
-                if loads.len() > 1 {
-                    return Err("more than one load".to_string());
-                }
-                // The address is lowered HERE, against the registers as the
-                // effects before this one have left them: a pre-indexed load
-                // reads from the base it has just updated.
+            for k in before..loads.len() {
+                // Each address is lowered HERE, against the registers as the
+                // effects before this one have left them (a pre-indexed load
+                // reads from the base it has just updated) and after the loads
+                // it reads.
                 let address_width = expr.load_address_width.unwrap_or(pc_width.max(32));
-                let address = ir::lower(&with_references(&loads[0].0, functions), address_width)
+                let address = ir::lower(&with_references(&loads[k].0, functions), address_width)
                     .map_err(|error| error.to_string())?;
-                *load_address =
-                    Some(lower_expr(graph, functions, &address, env, address_width)?);
-                env.insert(LOAD_INPUT.to_string(), graph.input(LOAD_INPUT, loads[0].1));
+                let addr = lower_expr(graph, functions, &address, env, address_width)?;
+                let (access, signed) = (loads[k].1, loads[k].2);
+                let input = load_input(k);
+                // The input carries the raw `access` bits; a sign extension is
+                // in the expression around it, so signedness does not make two
+                // reads of one place different.
+                let same = fresh.iter().map(|&i| &made[i]).find(|l| l.addr == addr && l.width == access);
+                let node = match same {
+                    Some(earlier) => env[&earlier.input],
+                    None => {
+                        fresh.push(made.len());
+                        made.push(HwLoad { addr, width: access, signed, input: input.clone() });
+                        graph.input(&input, access)
+                    }
+                };
+                env.insert(input, node);
             }
             let sem = ir::lower(&taken, width).map_err(|error| error.to_string())?;
             lower_expr(graph, functions, &sem, env, width)
@@ -2257,7 +2291,8 @@ fn lower_behavior(
                         addr,
                         addr.width.max(1),
                         &mut loads,
-                        &mut load_address,
+                        &mut made,
+                        &mut fresh,
                     )?;
                     (EffectKind::Store, *width, Some(address))
                 }
@@ -2267,14 +2302,12 @@ fn lower_behavior(
                 Loc::Trap => return Err("a trap, which has no circuit yet".to_string()),
                 _ => return Err("an effect that is not a register, pc or memory write".to_string()),
             };
-            let value =
-                value_of(graph, &mut env, &effect.value, width, &mut loads, &mut load_address)?;
+            let value = value_of(graph, &mut env, &effect.value, width, &mut loads, &mut made, &mut fresh)?;
             let guard = match &effect.guard {
                 None => None,
                 Some(guard) => {
                     let width = if guard.width == 0 { 32 } else { guard.width };
-                    let condition =
-                        value_of(graph, &mut env, guard, width, &mut loads, &mut load_address)?;
+                    let condition = value_of(graph, &mut env, guard, width, &mut loads, &mut made, &mut fresh)?;
                     let zero = graph.konst(0, width);
                     let is_zero = graph.eq(condition, zero);
                     Some(graph.not(is_zero))
@@ -2301,11 +2334,15 @@ fn lower_behavior(
                 };
                 env.insert(name.clone(), held);
             }
+            // After a store, memory is not what an earlier load read.
+            if kind == EffectKind::Store {
+                fresh.clear();
+            }
             lowered.push(HwEffect { kind, width, value, guard, addr });
         }
-        if let (Some(addr), Some((_, width, signed))) = (load_address, loads.first()) {
-            load = Some(HwLoad { addr, width: *width, signed: *signed });
-        }
+        let mut made = made.into_iter();
+        load = made.next();
+        extra_loads.extend(made);
         Ok(lowered)
     })();
     HwBehavior {
@@ -2313,6 +2350,7 @@ fn lower_behavior(
         inputs,
         state_inputs,
         load,
+        extra_loads,
         effects,
         unit: instruction.unit.trim().to_string(),
         latency: instruction.latency_cycles.max(1),
@@ -2483,6 +2521,62 @@ mod tests {
         // zero-extended it would be a different function.
         let value = run("(add i64 (add i32 rs1 rs2) 0)", RR, 64, &[0xffff_ffff, 1]);
         assert_eq!(value, 0x1_0000_0000);
+    }
+
+    fn loads_of(behavior_text: &str) -> HwBehavior {
+        let mut design = design_of(behavior_text);
+        design.behaviors.remove(0)
+    }
+
+    fn design_of(behavior_text: &str) -> HwDesign {
+        let source = format!(
+            r#"(axis-module loads
+  (version "0.1.0") (target rvmt) (description "loads")
+  (defisa loads (base rv64im) (word-bits 64) (registers "x[32]:i64" "pc:i64")
+    (features custom) (memory-model rvwmo) (endianness little))
+  (defformat L_R (bits 32)
+    (fields (opcode 6 0) (rd 11 7) (func3 14 12) (rs 19 15) (rs2 24 20) (func7 31 25)))
+  (definstruction probe
+    (mnemonic PROBE) (isa loads) (category custom) (format L_R)
+    (encoding (rs2 0)) (opcode 43) (func3 0) (func7 0)
+    (operands (rd reg i64 inout) (rs reg i64 in))
+    (asm "probe $rd, $rs") (semantics "loads")
+    (behavior {behavior_text})
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 1.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "loads")))"#
+        );
+        let document = crate::parse_document(&source).unwrap();
+        crate::validate_document(&document).unwrap();
+        lower_document(&document)
+    }
+
+    #[test]
+    fn a_load_in_an_address_is_made_first_and_feeds_it() {
+        // A table indexed by a byte read through `rd`: two loads, the inner one first.
+        let design = design_of(
+            "(set rd (load i32 unsigned (add i64 rs (shl i64 (zext i64 8 (load i8 unsigned rd)) 2))))",
+        );
+        let b = &design.behaviors[0];
+        assert!(b.effects.is_ok(), "{:?}", b.effects.as_ref().err());
+        let first = b.load.as_ref().unwrap();
+        assert_eq!(b.extra_loads.len(), 1);
+        let second = &b.extra_loads[0];
+        assert_eq!((first.width, second.width, second.input.as_str()), (8, 32, "%load1"));
+        // The first reads at rd; the second at rs + 4 * what the first returned.
+        let inputs: HashMap<String, u128> =
+            [("rd", 0x40), ("rs", 0x1000), ("%load", 5)].map(|(n, v)| (n.to_string(), v)).into();
+        assert_eq!(design.graph.eval(first.addr, &inputs), 0x40);
+        assert_eq!(design.graph.eval(second.addr, &inputs), 0x1014);
+    }
+
+    #[test]
+    fn reading_one_place_twice_is_one_load_unless_a_store_comes_between() {
+        let twice = loads_of("(set rd (add i64 (load i64 unsigned rs) (load i64 signed rs)))");
+        assert!(twice.load.is_some() && twice.extra_loads.is_empty());
+        let split = loads_of("(set rd (load i64 unsigned rs)) (store (add i64 rs 8) rd i64) (set rd (load i64 unsigned rs))");
+        assert!(split.load.is_some());
+        assert_eq!(split.extra_loads.len(), 1, "a store between makes the second read a load of its own");
     }
 
     #[test]

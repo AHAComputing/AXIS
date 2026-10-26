@@ -499,22 +499,27 @@ fn emit_effects(out: &mut String, design: &HwDesign) {
                 )
             })
             .collect();
-        let load = match &behavior.load {
-            Some(load) => format!(
+        let describe = |load: &crate::hw::HwLoad| {
+            format!(
                 "{{\"width\": {}, \"signed\": {}, \"address_width\": {}}}",
                 load.width,
                 python(load.signed),
                 design.graph.width(load.addr)
-            ),
-            None => "None".to_string(),
+            )
         };
+        let load = behavior.load.as_ref().map(describe).unwrap_or_else(|| "None".to_string());
+        // Every load, the first included, in the order they are made: a later
+        // one's address may read what an earlier one returned.
+        let all_loads: Vec<String> =
+            behavior.load.iter().chain(&behavior.extra_loads).map(describe).collect();
         out.push_str(&format!(
             "    {}: {{\"builder\": {}, \"inputs\": {}, \"state\": [{}], \"load\": {load}, \
-             \"effects\": [{}]}},\n",
+             \"loads\": [{}], \"effects\": [{}]}},\n",
             json_string(&behavior.mnemonic),
             json_string(&format!("build_effect_{}", python_ident(&behavior.mnemonic))),
             python_inputs(&behavior.inputs),
             behavior.state_inputs.iter().map(|name| json_string(name)).collect::<Vec<_>>().join(", "),
+            all_loads.join(", "),
             listed.join(", ")
         ));
     }
@@ -545,6 +550,12 @@ fn emit_effects(out: &mut String, design: &HwDesign) {
             parameters.insert(LOAD_INPUT.to_string(), "load".to_string());
             signature.push("load".to_string());
         }
+        // Further loads' values after it: `load1`, `load2`, ...
+        for (k, load) in behavior.extra_loads.iter().enumerate() {
+            let parameter = format!("load{}", k + 1);
+            parameters.insert(load.input.clone(), parameter.clone());
+            signature.push(parameter);
+        }
         let mut roots = Vec::new();
         let name = |id: Option<NodeId>, roots: &mut Vec<NodeId>| match id {
             Some(id) => {
@@ -554,6 +565,12 @@ fn emit_effects(out: &mut String, design: &HwDesign) {
             None => "None".to_string(),
         };
         let load_addr = name(behavior.load.as_ref().map(|load| load.addr), &mut roots);
+        let load_addrs: Vec<String> = behavior
+            .load
+            .iter()
+            .chain(&behavior.extra_loads)
+            .map(|load| name(Some(load.addr), &mut roots))
+            .collect();
         let wires: Vec<String> = effects
             .iter()
             .map(|effect| {
@@ -571,7 +588,11 @@ fn emit_effects(out: &mut String, design: &HwDesign) {
             signature.join(", ")
         ));
         let returns =
-            format!("{{\"load_addr\": {load_addr}, \"effects\": [{}]}}", wires.join(", "));
+            format!(
+                "{{\"load_addr\": {load_addr}, \"load_addrs\": [{}], \"effects\": [{}]}}",
+                load_addrs.join(", "),
+                wires.join(", ")
+            );
         emit_cones(out, &design.graph, &roots, &parameters, None, Some(&returns));
     }
 }
@@ -808,7 +829,7 @@ pub fn emit_hw_json_at(document: &Document, plan: Option<&str>, cycle: Option<f6
                     .flat_map(|effect| [Some(effect.value), effect.guard, effect.addr])
                     .flatten()
                     .collect();
-                roots.extend(behavior.load.as_ref().map(|load| load.addr));
+                roots.extend(behavior.load.iter().chain(&behavior.extra_loads).map(|load| load.addr));
                 let (area, depth) = design.graph.cone_cost(&roots);
                 format!(
                     "    {{\"mnemonic\": {}, \"status\": \"built\", \"effects\": {}, \
