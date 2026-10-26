@@ -1772,7 +1772,7 @@ def matrix(with_pce: bool) -> list[tuple[str, list[str], bool]]:
     gate("effect netlists == golden: RV32I", "hw_effects_check.py", example("rv32i.axisl"),
          "--expect-built", "33")
     gate("effect netlists == golden: RV64I", "hw_effects_check.py", example("rv64i.axisl"),
-         "--expect-built", "44")
+         "--expect-built", "53")
     # H1b: what a description says a built-in operator MEANS, held to the
     # built-in. The netlist lowering inlines these bodies where no backend has
     # a native implementation, and nothing else compares them.
