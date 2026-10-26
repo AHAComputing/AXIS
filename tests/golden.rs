@@ -3183,9 +3183,15 @@ fn c_and_rust_lifters_carry_the_same_table() {
     // is, and it is what decides whether the executors can hold it in a word.
     // The placement fields a scalable lane needs (docs/scalable_execution.md
     // §12) are zero for a scalar operand: no view, the class decides.
+    // Then what a decoder consumer needs without reading the semantics: how many
+    // bits the behavior sign extends (none: a register), and the register file,
+    // the index a field value of 0 selects, and the index wired to zero.
     assert!(rust.contains(
-        "LiftOperand { name: \"rs2\", kind: \"reg\", role: \"in\", encodable: true, derived_from: None, derived_add: 0, fixed: None, fields: &[LiftField { insn_lo: 20, op_lo: 0, width: 5 }], width: 32, register_bias: 0, stride: 0, view_offset: 0, view_width: 0, slot_base: 0 },"
+        "LiftOperand { name: \"rs2\", kind: \"reg\", role: \"in\", encodable: true, derived_from: None, derived_add: 0, fixed: None, fields: &[LiftField { insn_lo: 20, op_lo: 0, width: 5 }], width: 32, register_bias: 0, stride: 0, view_offset: 0, view_width: 0, slot_base: 0, signed_bits: 0, file: \"reg\", index_offset: 0, zero_index: None },"
     ));
+    // The row states its encoding width, assembly, and whether it has semantics.
+    assert!(rust.contains("        bits: 32,\n        asm: \"andn $rd, $rs1, $rs2\","));
+    assert!(rust.contains("        has_semantics: true,"));
     assert!(rust.contains("semantics: Some(\"(and i32 rs1 (not i32 rs2))\"),"));
     assert!(rust.contains("pub fn lift(word: u32) -> Option<Lifted> {"));
     assert!(rust.contains("value |= ((word >> field.insn_lo) & mask) << field.op_lo;"));

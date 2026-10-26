@@ -2176,11 +2176,12 @@ pub fn emit_lift_rust(document: &Document) -> String {
     // bits of it -- is published here as the C twin's table publishes it.
     // Without these the Rust executor read and wrote whole registers by index,
     // ran lane 0 alone, and no Rust scalable gate could be registered.
-    out.push_str("pub struct LiftOperand {\n    pub name: &'static str,\n    pub kind: &'static str,\n    pub role: &'static str,\n    pub encodable: bool,\n    pub derived_from: Option<usize>,\n    pub derived_add: u32,\n    pub fixed: Option<u32>,\n    pub fields: &'static [LiftField],\n    pub width: u32,\n    pub register_bias: u32,\n    pub stride: u32,\n    pub view_offset: u32,\n    pub view_width: u32,\n    pub slot_base: u32,\n}\n\n");
+    out.push_str("pub struct LiftOperand {\n    pub name: &'static str,\n    pub kind: &'static str,\n    pub role: &'static str,\n    pub encodable: bool,\n    pub derived_from: Option<usize>,\n    pub derived_add: u32,\n    pub fixed: Option<u32>,\n    pub fields: &'static [LiftField],\n    pub width: u32,\n    pub register_bias: u32,\n    pub stride: u32,\n    pub view_offset: u32,\n    pub view_width: u32,\n    pub slot_base: u32,\n    /// Bits the behavior sign extends this immediate from, or 0: an\n    /// offset and a shift amount are both `imm`, and only the semantics\n    /// tells them apart.\n    pub signed_bits: u32,\n    /// For a register operand, the file it names (\"\" for an immediate),\n    /// the register a field value of 0 selects, and the index wired to\n    /// zero, if the class has one: RISC-V's compressed forms reach x8-x15\n    /// through three bits, and x0 is neither read nor written.\n    pub file: &'static str,\n    pub index_offset: u32,\n    pub zero_index: Option<u32>,\n}\n\n");
     out.push_str("#[derive(Clone, Copy, Debug)]\n");
-    out.push_str("pub struct LiftEntry {\n    pub isa: &'static str,\n    pub mnemonic: &'static str,\n    pub match_: u32,\n    pub mask: u32,\n    pub liftable: bool,\n    pub operands: &'static [LiftOperand],\n    pub semantics: Option<&'static str>,\n    /// Which scalable instruction this is a lane of, and which lane.\n    /// Every lane shares its origin's encoding, so the decoder needs this\n    /// to tell one instruction's lanes from an ambiguous decode space.\n    pub scalable_origin: &'static str,\n    pub scalable_lane: u32,\n    /// Set when this entry is a definedness mask sharing another's word.\n    pub definedness: bool,\n    /// The ISA's register and program-counter width, which is not the\n    /// instruction word: a counter on a 32-bit machine wraps at 2**32.\n    pub state_width: u32,\n}\n\n");
+    out.push_str("pub struct LiftEntry {\n    pub isa: &'static str,\n    pub mnemonic: &'static str,\n    pub match_: u32,\n    pub mask: u32,\n    pub liftable: bool,\n    pub operands: &'static [LiftOperand],\n    pub semantics: Option<&'static str>,\n    /// Which scalable instruction this is a lane of, and which lane.\n    /// Every lane shares its origin's encoding, so the decoder needs this\n    /// to tell one instruction's lanes from an ambiguous decode space.\n    pub scalable_origin: &'static str,\n    pub scalable_lane: u32,\n    /// Set when this entry is a definedness mask sharing another's word.\n    pub definedness: bool,\n    /// The ISA's register and program-counter width, which is not the\n    /// instruction word: a counter on a 32-bit machine wraps at 2**32.\n    pub state_width: u32,\n    /// The instruction word's own width: 16 for a compressed form.\n    pub bits: u32,\n    /// The assembly template; its first word is the printed mnemonic.\n    pub asm: &'static str,\n    /// What the instruction touches beyond its operands\n    /// (`docs/effects_design.md` section 6), as the lift table states it.\n    pub reads_memory: bool,\n    pub writes_memory: bool,\n    pub reads_state: bool,\n    pub writes_state: bool,\n    pub writes_pc: bool,\n    /// The pc write is guarded: a conditional branch.\n    pub conditional_pc: bool,\n    pub may_trap: bool,\n    pub barrier: bool,\n    /// The widest memory access, in bits, or 0.\n    pub memory_bits: u32,\n    /// The description states what the instruction does, as `formal`\n    /// semantics or a `behavior`. When false it is decodable and nothing\n    /// more, and its effect flags above say nothing either way.\n    pub has_semantics: bool,\n}\n\n");
 
     out.push_str("pub static AXIS_LIFT_TABLE: &[LiftEntry] = &[\n");
+    let state_names = crate::effects::isa_scalar_state_names(&document.isas);
     for instruction in &document.instructions {
         let layout = layout_for(document, instruction);
         let encodable = layout.is_encodable();
@@ -2213,6 +2214,22 @@ pub fn emit_lift_rust(document: &Document) -> String {
                 .map(|isa| isa.word_bits)
                 .unwrap_or(64),
         ));
+        let summary = crate::effects::effect_summary(instruction, &state_names);
+        out.push_str(&format!(
+            "        bits: {},\n        asm: {},\n        reads_memory: {},\n        writes_memory: {},\n        reads_state: {},\n        writes_state: {},\n        writes_pc: {},\n        conditional_pc: {},\n        may_trap: {},\n        barrier: {},\n        memory_bits: {},\n        has_semantics: {},\n",
+            layout.bits,
+            json_string(&instruction_asm(instruction)),
+            summary.reads_memory,
+            summary.writes_memory,
+            summary.reads_state,
+            summary.writes_state,
+            summary.writes_pc,
+            crate::effects::writes_pc_conditionally(instruction),
+            summary.may_trap,
+            summary.barrier,
+            crate::effects::memory_access_bits(instruction),
+            has_semantics || instruction.behavior.is_some(),
+        ));
         out.push_str("        operands: &[\n");
         for operand in &instruction.operands {
             let bindings = layout.operand_bindings(&operand.name);
@@ -2231,8 +2248,9 @@ pub fn emit_lift_rust(document: &Document) -> String {
                 .iter()
                 .position(|candidate| candidate.name == operand.derived_from)
                 .map_or_else(|| "None".to_string(), |index| format!("Some({index})"));
+            let class = crate::ast::register_class(&operand.kind);
             out.push_str(&format!(
-                "            LiftOperand {{ name: {}, kind: {}, role: {}, encodable: {}, derived_from: {}, derived_add: {}, fixed: {}, fields: &[{}], width: {}, register_bias: {}, stride: {}, view_offset: {}, view_width: {}, slot_base: {} }},\n",
+                "            LiftOperand {{ name: {}, kind: {}, role: {}, encodable: {}, derived_from: {}, derived_add: {}, fixed: {}, fields: &[{}], width: {}, register_bias: {}, stride: {}, view_offset: {}, view_width: {}, slot_base: {}, signed_bits: {}, file: {}, index_offset: {}, zero_index: {} }},\n",
                 json_string(&operand.name),
                 json_string(&operand.kind),
                 json_string(role),
@@ -2246,7 +2264,13 @@ pub fn emit_lift_rust(document: &Document) -> String {
                 operand.slot_stride,
                 operand.view_offset,
                 operand.view_width,
-                operand.slot_base
+                operand.slot_base,
+                super::encode::signed_immediate_bits(instruction, &operand.name),
+                json_string(class.map_or("", |c| c.file)),
+                class.map_or(0, |c| c.index_offset),
+                class
+                    .and_then(|c| c.zero_index)
+                    .map_or_else(|| "None".to_string(), |index| format!("Some({index})")),
             ));
         }
         out.push_str("        ],\n");
@@ -2286,6 +2310,9 @@ pub fn emit_lift_rust(document: &Document) -> String {
     out.push_str("    let levels = (1u32 << length) - 1;\n");
     out.push_str("    imms & levels != levels\n");
     out.push_str("}\n\n");
+    // A compound constraint renders parenthesised so it nests; as a whole match
+    // arm the outer pair is redundant, and every consumer saw a rustc warning.
+    out.push_str("#[allow(unused_parens)]\n");
     out.push_str("fn constraint_ok(word: u32, entry: &LiftEntry) -> bool {\n");
     out.push_str("    let _ = word;\n");
     out.push_str("    match entry.mnemonic {\n");

@@ -2326,7 +2326,7 @@
       (rd rv_fpr i64 out)
       (rs1 rv_gpr i32 in)
       (imm imm i32 in))
-    (asm "fls $rd, $imm($rs1)")
+    (asm "flw $rd, $imm($rs1)")
     (semantics "Load a 32-bit float")
     (behavior
       (set rd (load i32 unsigned (add i32 rs1 (sext i32 12 imm))))
@@ -2349,7 +2349,7 @@
       (rs1 rv_gpr i32 in)
       (rs2 rv_fpr i64 in)
       (imm imm i32 in))
-    (asm "fss $rs2, $imm($rs1)")
+    (asm "fsw $rs2, $imm($rs1)")
     (semantics "Store a 32-bit float")
     (behavior
       (store (add i32 rs1 (sext i32 12 imm)) rs2 i32))

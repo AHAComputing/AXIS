@@ -2315,7 +2315,7 @@ axis_abi_operand_value, axis_abi_operands_buffer,\n  axis_abi_tables_aligned\n}}
 /// assembled correctly and printed back as `4294967291`, which is the same
 /// word and not the same text -- and an assembler whose output its own parser
 /// reads differently is not one anybody should publish.
-fn signed_immediate_bits(instruction: &Instruction, name: &str) -> u32 {
+pub(crate) fn signed_immediate_bits(instruction: &Instruction, name: &str) -> u32 {
     let mut text = instruction.formal_semantics.clone();
     if let Some(behavior) = instruction.behavior.as_ref() {
         for effect in &behavior.effects {
@@ -2324,6 +2324,13 @@ fn signed_immediate_bits(instruction: &Instruction, name: &str) -> u32 {
             if let Some(guard) = effect.guard.as_ref() {
                 text.push(' ');
                 text.push_str(&crate::effects::render_semantic_expr(&guard.expr));
+            }
+            // A store's offset is extended in its ADDRESS, not its value. Reading
+            // value and guard alone found nothing for `SB`/`SH`/`SW`/`SD`, so
+            // `sb x10, -1(x11)` printed as `4095(x11)` and lifted an offset of 4095.
+            if let crate::effects::Loc::Mem { addr, .. } = &effect.loc {
+                text.push(' ');
+                text.push_str(&crate::effects::render_semantic_expr(&addr.expr));
             }
         }
     }
