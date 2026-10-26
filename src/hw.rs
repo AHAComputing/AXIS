@@ -744,9 +744,35 @@ impl HwGraph {
 
     pub fn add(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let n = self.width(a);
+        // `(x + c1) + c2` is `x + (c1 + c2)`, both modulo 2^n. A constant step taken k
+        // times -- an induction a loop's lanes advance one after another -- is then one
+        // adder deep, not k adders in series.
+        for (constant, other) in [(b, a), (a, b)] {
+            let Some(c2) = self.as_const(constant) else { continue };
+            if let Some((x, c1)) = self.plus_constant(other) {
+                let c = self.konst(c1.wrapping_add(c2) & mask(n), n);
+                return self.add(x, c);
+            }
+        }
         let zero = self.konst(0, 1);
         let sum = self.addsub(a, b, zero);
         self.slice(sum, 0, n)
+    }
+
+    /// `x + c` as [`add`](Self::add) builds it -- the low bits of an adder with a constant
+    /// argument -- as `(x, c)`.
+    fn plus_constant(&self, v: NodeId) -> Option<(NodeId, u128)> {
+        let slice = &self.nodes[v];
+        if slice.op != HwOp::Slice || slice.value != 0 {
+            return None;
+        }
+        let sum = &self.nodes[slice.args[0]];
+        if sum.op != HwOp::AddSub || self.as_const(sum.args[2]) != Some(0) || sum.width != slice.width + 1 {
+            return None;
+        }
+        [(sum.args[0], sum.args[1]), (sum.args[1], sum.args[0])]
+            .into_iter()
+            .find_map(|(x, k)| self.as_const(k).map(|c| (x, c)))
     }
 
     /// `a - (a / b) * b` is the remainder the divider already has.
@@ -2457,6 +2483,18 @@ mod tests {
         // zero-extended it would be a different function.
         let value = run("(add i64 (add i32 rs1 rs2) 0)", RR, 64, &[0xffff_ffff, 1]);
         assert_eq!(value, 0x1_0000_0000);
+    }
+
+    #[test]
+    fn a_chain_of_constant_steps_is_one_adder_deep() {
+        // Four lanes of `x += 8`: each lane's value is `x` plus a constant, not the last
+        // lane's value plus 8, and the constants wrap at the width.
+        let (graph, root) = build("(add i64 (add i64 (add i64 (add i64 rs1 8) 8) 8) 8)", RR, 64);
+        assert_eq!(count(&graph, root, HwOp::AddSub), vec![65]);
+        assert_eq!(run("(add i64 (add i64 (add i64 (add i64 rs1 8) 8) 8) 8)", RR, 64, &[5, 0]), 37);
+        let wrapped = "(add i64 (add i64 rs1 0xffffffffffffffff) 2)";
+        assert_eq!(run(wrapped, RR, 64, &[u64::MAX as u128, 0]), 0);
+        assert_eq!(count(&build(wrapped, RR, 64).0, build(wrapped, RR, 64).1, HwOp::AddSub), vec![65]);
     }
 
     #[test]
