@@ -1770,9 +1770,13 @@ def matrix(with_pce: bool) -> list[tuple[str, list[str], bool]]:
     # with a memory that differs at every address. The count is pinned for the
     # same reason the declined count is above.
     gate("effect netlists == golden: RV32I", "hw_effects_check.py", example("rv32i.axisl"),
-         "--expect-built", "33")
+         "--expect-built", "35")
     gate("effect netlists == golden: RV64I", "hw_effects_check.py", example("rv64i.axisl"),
-         "--expect-built", "53")
+         "--expect-built", "57")
+    # Several loads in one instruction, each an address out and a value in:
+    # the block copies, sixteen loads and sixteen stores apiece.
+    gate("effect netlists == golden: block memory", "hw_effects_check.py",
+         example("blockmem.axisl"), "--expect-built", "5")
     # H1b: what a description says a built-in operator MEANS, held to the
     # built-in. The netlist lowering inlines these bodies where no backend has
     # a native implementation, and nothing else compares them.

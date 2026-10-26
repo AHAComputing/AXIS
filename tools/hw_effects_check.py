@@ -126,8 +126,11 @@ def main() -> int:
                 inputs = [pyrtl.Input(bitwidth=width, name=f"in{i}")
                           for i, (_, width) in enumerate(entry["inputs"])]
                 wires = list(inputs)
-                if entry["load"]:
-                    wires.append(pyrtl.Input(bitwidth=entry["load"]["width"], name="load"))
+                # Every load's value is an input, in the order the loads are
+                # made: `load`, then `load1`, `load2`, ...
+                loads = entry.get("loads") or ([entry["load"]] if entry["load"] else [])
+                for k, one in enumerate(loads):
+                    wires.append(pyrtl.Input(bitwidth=one["width"], name="load" if k == 0 else f"load{k}"))
                 built = getattr(rtl, entry["builder"])(*wires)
                 probes: dict[str, int] = {}
 
@@ -137,7 +140,8 @@ def main() -> int:
                         out <<= wire
                         probes[name] = len(wire)
 
-                probe("load_addr", built["load_addr"])
+                for k, wire in enumerate(built.get("load_addrs") or [built["load_addr"]]):
+                    probe(f"load_addr{k}", wire)
                 for index, effect in enumerate(built["effects"]):
                     for part in ("value", "guard", "addr"):
                         probe(f"{part}{index}", effect[part])
@@ -170,17 +174,25 @@ def main() -> int:
                         if written is not None and happens:
                             golden_env[written] = want[f"value{index}"] & mask(effect["width"])
                     drive = {f"in{i}": env[name] for i, (name, _) in enumerate(entry["inputs"])}
-                    if entry["load"]:
-                        # The address first, with nothing known about the data;
-                        # then the data the golden model's memory gave back.
-                        sim.step({**drive, "load": 0})
-                        want["load_addr"] = asked[0][0] if asked else None
-                        if not asked or asked[0][1] != entry["load"]["width"]:
-                            print(f"  FAIL {mnemonic}: the golden model reads {asked}, the "
-                                  f"netlist {entry['load']['width']} bits")
-                            failures += 1
-                            break
-                        drive["load"] = memory(*asked[0])
+                    # Each load in turn: its address with the earlier loads
+                    # answered, then what the same memory the golden model read
+                    # holds there. The netlist must read exactly the places the
+                    # golden model read; reading one place twice with no store
+                    # between may be one load.
+                    read: list[tuple[int, int]] = []
+                    for k, one in enumerate(loads):
+                        port = "load" if k == 0 else f"load{k}"
+                        sim.step({**drive, port: 0, **{("load" if j == 0 else f"load{j}"): 0
+                                                       for j in range(k + 1, len(loads))}})
+                        address = sim.inspect(f"load_addr{k}")
+                        want[f"load_addr{k}"] = address
+                        read.append((address, one["width"]))
+                        drive[port] = memory(address, one["width"])
+                    if set(read) != set(asked):
+                        print(f"  FAIL {mnemonic}: the golden model reads {sorted(set(asked))}, "
+                              f"the netlist {sorted(set(read))}")
+                        failures += 1
+                        break
                     sim.step(drive)
                     compared += 1
                     wrong = [name for name in probes
