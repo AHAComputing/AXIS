@@ -637,6 +637,60 @@ pub fn is_load(expr: &SemanticExpr) -> bool {
         if matches!(items.first(), Some(SemanticExpr::Atom(op)) if matches!(op.as_str(), "load" | "atomic_load")))
 }
 
+/// True when the behavior writes the pc only under a guard: a conditional
+/// branch, as opposed to a jump. The `when` around the `setpc` is the fact;
+/// deriving it from operand shapes would confuse `C.BEQZ` with `C.JR`.
+pub fn writes_pc_conditionally(instruction: &crate::ast::Instruction) -> bool {
+    behavior_is_authoritative(instruction)
+        && instruction.behavior.as_ref().is_some_and(|behavior| {
+            behavior
+                .effects
+                .iter()
+                .any(|effect| matches!(effect.loc, Loc::Pc) && effect.guard.is_some())
+        })
+}
+
+/// The widest memory access an instruction's behavior performs, in bits, or 0
+/// when it touches no memory: a store's own width, or the type of a load
+/// anywhere in its expressions (an atomic read-modify-write nests one).
+///
+/// A decoder consumer asks this of every load and store, and the answer is in
+/// the behavior already; without it each consumer re-derived it from mnemonics.
+pub fn memory_access_bits(instruction: &crate::ast::Instruction) -> u32 {
+    fn load_bits(expr: &SemanticExpr) -> u32 {
+        let SemanticExpr::List(items) = expr else {
+            return 0;
+        };
+        let own = if is_load(expr) {
+            items.get(1).and_then(type_atom_width).unwrap_or(0)
+        } else {
+            0
+        };
+        items.iter().map(load_bits).fold(own, u32::max)
+    }
+    if !behavior_is_authoritative(instruction) {
+        return 0;
+    }
+    let Some(behavior) = instruction.behavior.as_ref() else {
+        return 0;
+    };
+    let mut bits = 0;
+    for effect in &behavior.effects {
+        let mut expressions = vec![&effect.value.expr];
+        if let Loc::Mem { addr, width, .. } = &effect.loc {
+            bits = bits.max(*width);
+            expressions.push(&addr.expr);
+        }
+        if let Some(guard) = &effect.guard {
+            expressions.push(&guard.expr);
+        }
+        for expression in expressions {
+            bits = bits.max(load_bits(expression));
+        }
+    }
+    bits
+}
+
 /// True when `expr` performs a memory load anywhere, not only at the top level.
 /// An atomic read-modify-write nests its load inside the stored value
 /// (`atomic_store(addr, add(rs, atomic_load(addr)))`), so effect summaries must
