@@ -1777,13 +1777,17 @@ def matrix(with_pce: bool) -> list[tuple[str, list[str], bool]]:
     # the block copies, sixteen loads and sixteen stores apiece.
     gate("effect netlists == golden: block memory", "hw_effects_check.py",
          example("blockmem.axisl"), "--expect-built", "5")
+    # Loads made only when the effect they serve is applied: the netlist must
+    # read exactly the places the golden model reads, no more.
+    gate("effect netlists == golden: guarded loads", "hw_effects_check.py",
+         example("guarded_loads.axisl"), "--expect-built", "6", "--cases", "200")
     # H1b: what a description says a built-in operator MEANS, held to the
     # built-in. The netlist lowering inlines these bodies where no backend has
     # a native implementation, and nothing else compares them.
     gate("reference bodies == operators: A64", "hw_reference_check.py",
          example("aarch64_translation_seed.axisl"), "--expect", "23", slow=True)
     gate("effect netlists == golden: A64", "hw_effects_check.py",
-         example("aarch64_translation_seed.axisl"), "--expect-built", "387", slow=True)
+         example("aarch64_translation_seed.axisl"), "--expect-built", "419", slow=True)
     # T1: a core's own word on latency and unit (docs/core_timing_design.md).
     # No corpus says anything yet, so nothing published has moved; a core that
     # does is published resolved, survives the printer, and is refused by the

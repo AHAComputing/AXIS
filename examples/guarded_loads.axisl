@@ -1,0 +1,111 @@
+; Guarded loads: a load an effect makes only when its guard holds.
+;
+; A guarded write is skipped when its guard is false -- the executors do not
+; evaluate its value or its address -- so the memory those read is not read
+; either. A netlist that made every load always would read places the golden
+; model never asks for: a page the program does not touch, a device register,
+; one past the end of a buffer. Each load in an effect netlist therefore carries
+; when it is made: the guard of the effects it serves, OR'd where several read
+; it, and always where any unguarded one does or the guard itself reads it.
+;
+; The conditions test low bits so that random registers take both sides.
+(axis-module guarded_loads
+  (version "0.1.0")
+  (target rvmt)
+  (description "Loads made only when the effect they serve is applied")
+
+  (defisa guarded_loads
+    (base rv64im)
+    (word-bits 64)
+    (registers "x[32]:i64" "pc:i64")
+    (features custom)
+    (memory-model rvwmo)
+    (endianness little))
+
+  (defformat GL_R
+    (bits 32)
+    (fields
+      (opcode 6 0)
+      (rd 11 7)
+      (func3 14 12)
+      (rs 19 15)
+      (rs2 24 20)
+      (func7 31 25)))
+
+  (definstruction ldif
+    (mnemonic LDIF) (isa guarded_loads) (category custom) (format GL_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 0) (func7 0)
+    (operands (rd reg i64 inout) (rs reg i64 in))
+    (asm "ldif $rd, $rs")
+    (semantics "Load through rs when its low bit is clear")
+    (behavior
+      (when (icmp_eq (and i64 rs 1) 0) (set rd (load i64 unsigned rs))))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Load through rs when its low bit is clear"))
+
+  (definstruction ldifzb
+    (mnemonic LDIFZB) (isa guarded_loads) (category custom) (format GL_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 1) (func7 1)
+    (operands (rd reg i64 inout) (rs reg i64 in))
+    (asm "ldifzb $rd, $rs")
+    (semantics "Load through rd when the byte at rs is even: the guard reads a load, the load it guards comes after it")
+    (behavior
+      (when (icmp_eq (and i64 (zext i64 8 (load i8 unsigned rs)) 1) 0) (set rd (load i64 unsigned rd))))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Load through rd when the byte at rs is even: the guard reads a load, the load it guards comes after it"))
+
+  (definstruction ldalso
+    (mnemonic LDALSO) (isa guarded_loads) (category custom) (format GL_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 2) (func7 2)
+    (operands (rd reg i64 inout) (rs reg i64 in))
+    (asm "ldalso $rd, $rs")
+    (semantics "The same place read under a guard and then unguarded: one load, made always")
+    (behavior
+      (when (icmp_eq (and i64 rs 1) 0) (set rd (load i64 unsigned rs))) (set rd (add i64 rd (load i64 unsigned rs))))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "The same place read under a guard and then unguarded: one load, made always"))
+
+  (definstruction ldeither
+    (mnemonic LDEITHER) (isa guarded_loads) (category custom) (format GL_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 3) (func7 3)
+    (operands (rd reg i64 inout) (rs reg i64 in))
+    (asm "ldeither $rd, $rs")
+    (semantics "The same place read under two guards: one load, made when either holds")
+    (behavior
+      (when (icmp_eq (and i64 rs 3) 0) (set rd (load i64 unsigned rs))) (when (icmp_eq (and i64 rs 3) 1) (set rd (add i64 rd (load i64 unsigned rs)))))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "The same place read under two guards: one load, made when either holds"))
+
+  (definstruction stif
+    (mnemonic STIF) (isa guarded_loads) (category custom) (format GL_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 4) (func7 4)
+    (operands (rd reg i64 inout) (rs reg i64 in))
+    (asm "stif $rd, $rs")
+    (semantics "Copy a halfword from rd to rs when rd's low bit is clear: a guarded store's value loads")
+    (behavior
+      (when (icmp_eq (and i64 rd 1) 0) (store rs (load i16 unsigned rd) i16)))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "Copy a halfword from rd to rs when rd's low bit is clear: a guarded store's value loads"))
+
+  (definstruction ldchain
+    (mnemonic LDCHAIN) (isa guarded_loads) (category custom) (format GL_R)
+    (encoding (rs2 0))
+    (opcode 43) (func3 5) (func7 5)
+    (operands (rd reg i64 inout) (rs reg i64 in))
+    (asm "ldchain $rd, $rs")
+    (semantics "A table read under a guard that reads memory, its index loaded under the same guard")
+    (behavior
+      (when (icmp_eq (and i64 (load i64 unsigned rs) 1) 0) (set rd (load i32 unsigned (add i64 rs (shl i64 (and i64 (load i64 unsigned rd) 0xff) 2))))))
+    (latency 1) (throughput 1.0)
+    (area-estimate-um2 900.0) (power-estimate-mw 1.0) (expected-speedup 1.0)
+    (rationale "A table read under a guard that reads memory, its index loaded under the same guard")))
