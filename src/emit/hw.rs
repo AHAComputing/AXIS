@@ -501,10 +501,11 @@ fn emit_effects(out: &mut String, design: &HwDesign) {
             .collect();
         let describe = |load: &crate::hw::HwLoad| {
             format!(
-                "{{\"width\": {}, \"signed\": {}, \"address_width\": {}}}",
+                "{{\"width\": {}, \"signed\": {}, \"address_width\": {}, \"guarded\": {}}}",
                 load.width,
                 python(load.signed),
-                design.graph.width(load.addr)
+                design.graph.width(load.addr),
+                python(load.guard.is_some())
             )
         };
         let load = behavior.load.as_ref().map(describe).unwrap_or_else(|| "None".to_string());
@@ -571,6 +572,13 @@ fn emit_effects(out: &mut String, design: &HwDesign) {
             .chain(&behavior.extra_loads)
             .map(|load| name(Some(load.addr), &mut roots))
             .collect();
+        // When each load is made: `None` always, else a one-bit wire.
+        let load_guards: Vec<String> = behavior
+            .load
+            .iter()
+            .chain(&behavior.extra_loads)
+            .map(|load| name(load.guard, &mut roots))
+            .collect();
         let wires: Vec<String> = effects
             .iter()
             .map(|effect| {
@@ -589,8 +597,9 @@ fn emit_effects(out: &mut String, design: &HwDesign) {
         ));
         let returns =
             format!(
-                "{{\"load_addr\": {load_addr}, \"load_addrs\": [{}], \"effects\": [{}]}}",
+                "{{\"load_addr\": {load_addr}, \"load_addrs\": [{}], \"load_guards\": [{}], \"effects\": [{}]}}",
                 load_addrs.join(", "),
+                load_guards.join(", "),
                 wires.join(", ")
             );
         emit_cones(out, &design.graph, &roots, &parameters, None, Some(&returns));

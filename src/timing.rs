@@ -525,7 +525,7 @@ pub fn floors(document: &Document, core: &Core) -> Vec<Floor> {
             .flat_map(|effect| [Some(effect.value), effect.guard, effect.addr])
             .flatten()
             .collect();
-        roots.extend(behavior.load.iter().chain(&behavior.extra_loads).map(|load| load.addr));
+        roots.extend(behavior.load.iter().chain(&behavior.extra_loads).flat_map(|load| [Some(load.addr), load.guard]).flatten());
         let (_, depth) = design.graph.cone_cost(&roots);
         found.push(Floor {
             mnemonic: behavior.mnemonic.clone(),

@@ -2048,6 +2048,12 @@ pub struct HwLoad {
     pub width: u32,
     pub signed: bool,
     pub input: String,
+    /// When the load is made: `None` always; otherwise a one-bit condition,
+    /// the guard of the effects it serves. A guarded write's value is not
+    /// read when its guard is false -- the executors skip the effect -- so
+    /// neither is the memory it loads. A load several effects read is made
+    /// when any of them is applied; one an unguarded effect reads, always.
+    pub guard: Option<NodeId>,
 }
 
 /// The input carrying what load `k` of an instruction read.
@@ -2235,6 +2241,10 @@ fn lower_behavior(
         // reading the same place twice with no store between is one load.
         let mut made: Vec<HwLoad> = Vec::new();
         let mut fresh: Vec<usize> = Vec::new();
+        // Which of `made` each lowering read, and for each load, when it is made
+        // so far: `None` until an effect reads it, then `Some(guard)`.
+        let mut read: Vec<usize> = Vec::new();
+        let mut when: Vec<Option<Option<NodeId>>> = Vec::new();
         // Lower one expression at `width`, taking out its loads.
         let mut value_of = |graph: &mut HwGraph,
                             env: &mut HashMap<String, NodeId>,
@@ -2242,7 +2252,8 @@ fn lower_behavior(
                             width: u32,
                             loads: &mut Vec<(SemanticExpr, u32, bool)>,
                             made: &mut Vec<HwLoad>,
-                            fresh: &mut Vec<usize>|
+                            fresh: &mut Vec<usize>,
+                            read: &mut Vec<usize>|
          -> Result<NodeId, String> {
             if width == 0 || width > MAX_WIDTH {
                 return Err("an effect with no width, or one wider than the graph holds".to_string());
@@ -2263,12 +2274,16 @@ fn lower_behavior(
                 // The input carries the raw `access` bits; a sign extension is
                 // in the expression around it, so signedness does not make two
                 // reads of one place different.
-                let same = fresh.iter().map(|&i| &made[i]).find(|l| l.addr == addr && l.width == access);
+                let same = fresh.iter().copied().find(|&i| made[i].addr == addr && made[i].width == access);
                 let node = match same {
-                    Some(earlier) => env[&earlier.input],
+                    Some(earlier) => {
+                        read.push(earlier);
+                        env[&made[earlier].input]
+                    }
                     None => {
                         fresh.push(made.len());
-                        made.push(HwLoad { addr, width: access, signed, input: input.clone() });
+                        read.push(made.len());
+                        made.push(HwLoad { addr, width: access, signed, input: input.clone(), guard: None });
                         graph.input(&input, access)
                     }
                 };
@@ -2278,6 +2293,22 @@ fn lower_behavior(
             lower_expr(graph, functions, &sem, env, width)
         };
         for effect in &behavior.effects {
+            // The guard first: what it reads is read always, and a load the
+            // address or the value makes may be made only when it holds -- so
+            // its loads come before theirs, and a consumer answering loads in
+            // order knows each one's guard when it reaches it.
+            let guard = match &effect.guard {
+                None => None,
+                Some(guard) => {
+                    let width = if guard.width == 0 { 32 } else { guard.width };
+                    let condition =
+                        value_of(graph, &mut env, guard, width, &mut loads, &mut made, &mut fresh, &mut read)?;
+                    let zero = graph.konst(0, width);
+                    let is_zero = graph.eq(condition, zero);
+                    Some(graph.not(is_zero))
+                }
+            };
+            let always = std::mem::take(&mut read);
             let (kind, width, addr) = match &effect.loc {
                 Loc::Reg(dest) => (EffectKind::Set { dest: dest.clone() }, effect.value.width, None),
                 Loc::Pc => (EffectKind::SetPc, effect.value.width, None),
@@ -2293,6 +2324,7 @@ fn lower_behavior(
                         &mut loads,
                         &mut made,
                         &mut fresh,
+                        &mut read,
                     )?;
                     (EffectKind::Store, *width, Some(address))
                 }
@@ -2302,17 +2334,16 @@ fn lower_behavior(
                 Loc::Trap => return Err("a trap, which has no circuit yet".to_string()),
                 _ => return Err("an effect that is not a register, pc or memory write".to_string()),
             };
-            let value = value_of(graph, &mut env, &effect.value, width, &mut loads, &mut made, &mut fresh)?;
-            let guard = match &effect.guard {
-                None => None,
-                Some(guard) => {
-                    let width = if guard.width == 0 { 32 } else { guard.width };
-                    let condition = value_of(graph, &mut env, guard, width, &mut loads, &mut made, &mut fresh)?;
-                    let zero = graph.konst(0, width);
-                    let is_zero = graph.eq(condition, zero);
-                    Some(graph.not(is_zero))
-                }
-            };
+            let value =
+                value_of(graph, &mut env, &effect.value, width, &mut loads, &mut made, &mut fresh, &mut read)?;
+            when.resize(made.len(), None);
+            for (k, under) in always.into_iter().map(|k| (k, None)).chain(read.drain(..).map(|k| (k, guard))) {
+                when[k] = Some(match (when[k], under) {
+                    (None, under) => under,
+                    (Some(Some(earlier)), Some(under)) => Some(graph.or(earlier, under)),
+                    _ => None,
+                });
+            }
             // ⚠️ Effects happen IN ORDER. What this one writes is what the
             // next one reads: `rn = rn + imm; Mem[rn] = rt` stores at the
             // updated base. The executors get that from a register file they
@@ -2339,6 +2370,18 @@ fn lower_behavior(
                 fresh.clear();
             }
             lowered.push(HwEffect { kind, width, value, guard, addr });
+        }
+        for (load, when) in made.iter_mut().zip(when) {
+            load.guard = when.flatten();
+        }
+        // A load read again under a later effect's guard may have a guard that
+        // reads a load made after it; no consumer answering in order can make it.
+        for (k, load) in made.iter().enumerate() {
+            let Some(guard) = load.guard else { continue };
+            let cone = graph.cone(&[guard]);
+            if made[k..].iter().any(|later| cone.contains(&env[&later.input])) {
+                return Err("a load whose guard reads a load made after it".to_string());
+            }
         }
         let mut made = made.into_iter();
         load = made.next();
@@ -2376,7 +2419,7 @@ pub fn modelled_costs(document: &Document) -> HashMap<String, (f64, f64)> {
             .flat_map(|effect| [Some(effect.value), effect.guard, effect.addr])
             .flatten()
             .collect();
-        roots.extend(behavior.load.as_ref().map(|load| load.addr));
+        roots.extend(behavior.load.iter().chain(&behavior.extra_loads).flat_map(|load| [Some(load.addr), load.guard]).flatten());
         costs.entry(behavior.mnemonic.clone()).or_insert_with(|| design.graph.cone_cost(&roots));
     }
     costs
@@ -2577,6 +2620,38 @@ mod tests {
         let split = loads_of("(set rd (load i64 unsigned rs)) (store (add i64 rs 8) rd i64) (set rd (load i64 unsigned rs))");
         assert!(split.load.is_some());
         assert_eq!(split.extra_loads.len(), 1, "a store between makes the second read a load of its own");
+    }
+
+    #[test]
+    fn a_load_a_guarded_write_reads_is_made_only_under_its_guard() {
+        let design = design_of("(when (icmp_eq (and i64 rs 1) 0) (set rd (load i64 unsigned rs)))");
+        let b = &design.behaviors[0];
+        let guard = b.load.as_ref().unwrap().guard.expect("the load is guarded");
+        let at = |rs: u128| design.graph.eval(guard, &[("rs".to_string(), rs)].into());
+        assert_eq!((at(0x1000), at(0x1001)), (1, 0));
+        // Unguarded, and read by the guard itself: always.
+        assert!(loads_of("(set rd (load i64 unsigned rs))").load.unwrap().guard.is_none());
+        let guarding = loads_of("(when (icmp_eq (load i8 unsigned rs) 0) (set rd (load i64 unsigned rd)))");
+        assert!(guarding.load.as_ref().unwrap().guard.is_none(), "the guard's load comes first, made always");
+        assert!(guarding.extra_loads[0].guard.is_some());
+    }
+
+    #[test]
+    fn a_load_several_effects_read_is_made_when_any_of_them_is_applied() {
+        let both = loads_of(
+            "(when (icmp_eq (and i64 rs 1) 0) (set rd (load i64 unsigned rs))) (set rd (add i64 rd (load i64 unsigned rs)))",
+        );
+        assert!(both.extra_loads.is_empty() && both.load.unwrap().guard.is_none());
+        let design = design_of(
+            "(when (icmp_eq (and i64 rs 3) 0) (set rd (load i64 unsigned rs))) \
+             (when (icmp_eq (and i64 rs 3) 1) (set rd (add i64 rd (load i64 unsigned rs))))",
+        );
+        let b = &design.behaviors[0];
+        assert!(b.extra_loads.is_empty());
+        let guard = b.load.as_ref().unwrap().guard.unwrap();
+        let made: Vec<u128> =
+            (0..4).map(|rs| design.graph.eval(guard, &[("rs".to_string(), rs)].into())).collect();
+        assert_eq!(made, vec![1, 1, 0, 0]);
     }
 
     #[test]

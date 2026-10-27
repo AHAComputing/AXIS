@@ -1777,6 +1777,10 @@ def matrix(with_pce: bool) -> list[tuple[str, list[str], bool]]:
     # the block copies, sixteen loads and sixteen stores apiece.
     gate("effect netlists == golden: block memory", "hw_effects_check.py",
          example("blockmem.axisl"), "--expect-built", "5")
+    # Loads made only when the effect they serve is applied: the netlist must
+    # read exactly the places the golden model reads, no more.
+    gate("effect netlists == golden: guarded loads", "hw_effects_check.py",
+         example("guarded_loads.axisl"), "--expect-built", "6", "--cases", "200")
     # H1b: what a description says a built-in operator MEANS, held to the
     # built-in. The netlist lowering inlines these bodies where no backend has
     # a native implementation, and nothing else compares them.

@@ -138,14 +138,37 @@ is taken out, its address lowered on its own, and what was read comes back as
 an input, sign-extended as the golden model reads it. A store is an address
 and a value out. What is on the other side is a core's.
 
+**Several loads.** Each load is its own address out and value in (`load`,
+`load1`, ...), in the order they are made: a load inside another's address is
+made first, and its value is what that address reads. Reading one place at one
+width twice, with no store between, is one load.
+
+**When a load is made.** A guarded effect is skipped when its guard is false:
+the executors do not evaluate its value or its address, so they do not read the
+memory those load. Each load therefore carries a guard of its own, `None` for
+always or a one-bit wire: the guard of the effects whose value or address reads
+it, OR'd where several do, and always where an unguarded effect does or where a
+guard itself reads it. A core makes the load only when its guard holds; making
+it anyway reads places the program never touches -- a page that faults, a device
+register, one past the end of a buffer. A guard is lowered before its effect's
+value, so its loads come first, and a load whose guard would read a load made
+after it is declined. A `select` is not a guard: the loads of both its arms are
+made.
+
 `emit-hw-pyrtl` gives each a `build_effect_<mnemonic>` returning those wires
-and lists them in `EFFECTS`; what it cannot lower is in `EFFECTS_DECLINED` with
-the reason -- an atomic store, a trap, two loads in one instruction.
+(`load_addrs` and `load_guards`, one per load, then the effects') and lists them
+in `EFFECTS`, each load marked `guarded` or not; what it cannot lower is in
+`EFFECTS_DECLINED` with the reason -- an atomic store, a trap.
 
 `tools/hw_effects_check.py` holds every value, guard and address to the golden
 model's own evaluator on the expressions `emit-lift-json` publishes, with a
 memory that is different at every address and width: a memory of zeros would
 agree with a netlist that read the wrong place.
+It also holds the netlist to the places the golden model reads, exactly: an
+effect whose guard is false is skipped as the executors skip it, and the loads
+the netlist makes must be the reads the golden model made.
+`examples/guarded_loads.axisl` is its corpus for guards; the netlists AXIS
+emitted before loads had guards fail it on five of its six instructions.
 
 | corpus | effect netlists | of which |
 |---|---|---|

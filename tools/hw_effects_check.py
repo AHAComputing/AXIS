@@ -14,7 +14,11 @@ Each of those is held to the golden model's own evaluator, on the expressions
   * every effect's **value** and **guard**;
   * a store's **address**;
   * a load's **address** -- the one the golden model asks its memory for -- and
-    then the value, with exactly what that memory returned driven in.
+    then the value, with exactly what that memory returned driven in;
+  * a load's **guard**: the netlist makes a load exactly when the golden model
+    reads that place. A guarded effect's value and address are not evaluated
+    when its guard is false -- the executors skip the effect -- so neither is
+    the memory they load, and neither is compared.
 
 ⚠️ Effects happen IN ORDER. A pre-indexed store is `rn = rn + imm; Mem[rn] =
 rt`, and the address is the updated base: the executors evaluate effects one
@@ -142,6 +146,8 @@ def main() -> int:
 
                 for k, wire in enumerate(built.get("load_addrs") or [built["load_addr"]]):
                     probe(f"load_addr{k}", wire)
+                for k, wire in enumerate(built.get("load_guards") or []):
+                    probe(f"load_guard{k}", wire)
                 for index, effect in enumerate(built["effects"]):
                     for part in ("value", "guard", "addr"):
                         probe(f"{part}{index}", effect[part])
@@ -156,12 +162,18 @@ def main() -> int:
 
                     golden_env = {**env, "__mem__": reader}
                     want: dict[str, int] = {}
+                    skipped: set[str] = set()
                     for index, effect in enumerate(published):
                         happens = True
                         if effect.get("guard"):
                             happens = golden._eval_axis_expr(
                                 effect["guard"], golden_env, effect["guard_width"]) != 0
                             want[f"guard{index}"] = int(happens)
+                        if not happens:
+                            # Skipped, as the executors skip it: nothing it would
+                            # have read is read.
+                            skipped |= {f"addr{index}", f"value{index}"}
+                            continue
                         if effect["kind"] == "store":
                             want[f"addr{index}"] = golden._eval_axis_expr(
                                 effect["addr"], golden_env, effect["addr_width"])
@@ -184,7 +196,17 @@ def main() -> int:
                         port = "load" if k == 0 else f"load{k}"
                         sim.step({**drive, port: 0, **{("load" if j == 0 else f"load{j}"): 0
                                                        for j in range(k + 1, len(loads))}})
+                        # A guard is held to the golden model by what is read:
+                        # the places below must be the places it asked for.
+                        made = f"load_guard{k}" not in probes or sim.inspect(f"load_guard{k}") == 1
+                        skipped.add(f"load_guard{k}")
                         address = sim.inspect(f"load_addr{k}")
+                        if not made:
+                            # Not made: its address is not compared, and what
+                            # comes back is nothing a skipped effect reads.
+                            skipped.add(f"load_addr{k}")
+                            drive[port] = 0
+                            continue
                         want[f"load_addr{k}"] = address
                         read.append((address, one["width"]))
                         drive[port] = memory(address, one["width"])
@@ -195,8 +217,8 @@ def main() -> int:
                         break
                     sim.step(drive)
                     compared += 1
-                    wrong = [name for name in probes
-                             if sim.inspect(name) != want[name] & mask(probes[name])]
+                    wrong = [name for name in probes if name not in skipped
+                             and sim.inspect(name) != want[name] & mask(probes[name])]
                     if wrong:
                         name = wrong[0]
                         print(f"  FAIL {mnemonic} {env}: `{name}` is {sim.inspect(name):#x}, "
