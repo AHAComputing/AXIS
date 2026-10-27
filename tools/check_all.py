@@ -1787,7 +1787,7 @@ def matrix(with_pce: bool) -> list[tuple[str, list[str], bool]]:
     gate("reference bodies == operators: A64", "hw_reference_check.py",
          example("aarch64_translation_seed.axisl"), "--expect", "23", slow=True)
     gate("effect netlists == golden: A64", "hw_effects_check.py",
-         example("aarch64_translation_seed.axisl"), "--expect-built", "387", slow=True)
+         example("aarch64_translation_seed.axisl"), "--expect-built", "419", slow=True)
     # T1: a core's own word on latency and unit (docs/core_timing_design.md).
     # No corpus says anything yet, so nothing published has moved; a core that
     # does is published resolved, survives the printer, and is refused by the
