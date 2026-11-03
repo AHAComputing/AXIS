@@ -43,7 +43,6 @@ const ACCELERATOR_TARGETS: &[&str] = &[
     "imc",
     "dae",
     "ste",
-    "spc",
     "structured_asic",
     "spatial_dataflow",
     "systolic_array",

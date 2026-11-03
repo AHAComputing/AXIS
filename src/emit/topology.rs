@@ -1113,7 +1113,6 @@ fn is_known_aha_accelerator(accelerator: &Accelerator) -> bool {
             | "imc"
             | "dae"
             | "ste"
-            | "spc"
             | "structured_asic"
             | "spatial_dataflow"
             | "systolic_array"
